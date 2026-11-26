@@ -13,7 +13,7 @@
   </style>
 </head>
 <body>
-  <header><div class="brand">✳ Custos</div><nav class="nav"><a href="/">Skill 管理</a><a href="/runtime-page">运行时管理</a><a href="/secrets-page">环境变量</a><a class="active" href="/runtime-logs-page">运行时日志</a></nav></header>
+  <header><div class="brand">✳ Custos</div><nav class="nav"><a href="/">Skill 管理</a><a href="/secrets-page">环境变量</a><a class="active" href="/runtime-logs-page">运行时日志</a></nav></header>
   <main><div class="eyebrow">RUNTIME ACTIVITY</div><h1>运行时日志</h1><p class="lead">查看 WorkBuddy 通过 MCP 调用 Skill 工具的历史记录。代码和环境变量值不会写入日志。</p>
     <section class="card"><div class="toolbar"><div><strong>工具调用历史</strong><br><span>记录配置获取与代码运行的安全摘要，最新记录在前</span></div><div class="filters"><select id="tool-filter"><option value="">全部工具</option><option value="get_skill_config">get_skill_config</option><option value="run_code">run_code</option></select><input id="skill-filter" placeholder="按 Skill ID 筛选"><button class="secondary" id="refresh">刷新</button></div></div>
       <div class="toolbar" style="border-bottom:0;padding-top:10px;padding-bottom:8px"><span class="count" id="count">读取中…</span><span>最多显示最近 200 条</span></div>

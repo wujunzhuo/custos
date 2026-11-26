@@ -772,9 +772,8 @@ class RequestHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(page)))
             self.end_headers()
             return self.wfile.write(page)
-        if path in {"/runtime-page", "/secrets-page", "/runtime-logs-page"}:
-            filename = {"/runtime-page": "runtime.html", "/secrets-page": "secrets.html",
-                        "/runtime-logs-page": "runtime-logs.html"}[path]
+        if path in {"/secrets-page", "/runtime-logs-page"}:
+            filename = {"/secrets-page": "secrets.html", "/runtime-logs-page": "runtime-logs.html"}[path]
             try:
                 page = (Path(__file__).parent / "static" / filename).read_bytes()
             except OSError:

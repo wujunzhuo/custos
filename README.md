@@ -5,7 +5,6 @@ Custos 是单进程、零第三方依赖的 Python 原型，用于验证 Skill �
 ## 管理页面
 
 - **Skill 管理**（`/`）：创建并发布两个初始化示例，也可自然语言生成其他 Skill 草稿，人工修改后发布；可根据 Skill 定义和用户引导生成模拟测试提问，并下载 WorkBuddy Skill 包。
-- **运行时管理**（`/runtime-page`）：设置最长运行时间、CPU/内存上限、外网白/黑名单。
 - **环境变量管理**（`/secrets-page`）：查看和配置变量名、明文值及团队范围。`GET /secrets` 同样返回明文值（POC 专用）；审计记录不包含变量值。Skill 仅声明所需变量名；运行时检查团队权限后，只向本次子进程注入声明过的变量。
 - **运行时日志**（`/runtime-logs-page`）：查询 WorkBuddy 通过 MCP 调用 Skill 工具的历史记录，只展示调用摘要，不保存代码或密钥值。
 
@@ -71,7 +70,7 @@ python3 app.py
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/`、`/runtime-page`、`/secrets-page`、`/runtime-logs-page` | 管理页面 |
+| GET | `/`、`/secrets-page`、`/runtime-logs-page` | 管理页面 |
 | GET | `/skills` | 已发布 Skill 列表 |
 | POST | `/skill/generate` | 自然语言生成 Skill 草稿 |
 | POST | `/skill/test-questions` | 根据已发布 Skill 和用户引导生成模拟提问 |
