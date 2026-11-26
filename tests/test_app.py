@@ -6,7 +6,7 @@ from pathlib import Path
 
 from app import (GENERATOR, RUNTIME_CONFIG, SANDBOXES, SECRETS, SKILLS, STORE,
                  RuntimeConfig, SecretEnvVar, SkillMeta, UserContext,
-                 build_app, mcp_call, open_code_bundle)
+                 build_app, mcp_call, workbuddy_bundle)
 
 
 class CustosTests(unittest.TestCase):
@@ -103,15 +103,17 @@ class CustosTests(unittest.TestCase):
         finally:
             STORE.runtime_config = old
 
-    def test_environment_variable_values_are_not_returned_or_audited(self):
+    def test_environment_variable_values_are_visible_but_not_audited(self):
+        value = "/private/path/not-for-response"
         result = SECRETS.configure(
-            SecretEnvVar("EXAMPLE_PATH", "/private/path/not-for-response", ["custos-team"]),
+            SecretEnvVar("EXAMPLE_PATH", value, ["custos-team"]),
             UserContext("admin", "platform", permissions=["admin"]),
         )
         self.assertTrue(result["ok"])
-        self.assertNotIn("/private/path/not-for-response", json.dumps(result))
-        self.assertNotIn("/private/path/not-for-response", json.dumps(SECRETS.list_public()))
-        self.assertNotIn("/private/path/not-for-response", json.dumps(STORE.audit))
+        visible = next(item for item in SECRETS.list_public() if item["name"] == "EXAMPLE_PATH")
+        self.assertEqual(visible["value"], value)
+        self.assertNotIn(value, json.dumps(result))
+        self.assertNotIn(value, json.dumps(STORE.audit))
 
     def test_mcp_runtime_config_and_generic_runner(self):
         user = UserContext("alice", "custos-team")
@@ -124,24 +126,45 @@ class CustosTests(unittest.TestCase):
         self.assertFalse(result.get("isError", False))
         self.assertIn("True", result["structuredContent"]["stdout"])
 
-    def test_weekly_server_title_is_not_in_downloaded_skill_file(self):
+    def test_workbuddy_bundle_contains_skill_and_mcp_config(self):
         weekly = SKILLS.effective("weekly-report", UserContext("alice", "custos-team"))["data"]
         self.assertIn("Custos 团队周报", weekly["system_prompt_snippet"])
-        bundle = open_code_bundle(weekly, "http://localhost:8000", UserContext("alice", "custos-team"))
+        bundle = workbuddy_bundle(weekly, "http://localhost:8000", UserContext("alice", "custos-team"))
         with zipfile.ZipFile(BytesIO(bundle)) as archive:
-            hidden_skill = archive.read(".opencode/skills/weekly-report/SKILL.md").decode()
+            skill = archive.read("skills/weekly-report/SKILL.md").decode()
             visible_skill = archive.read("SKILL.md").decode()
-            config = json.loads(archive.read("opencode.jsonc"))
-        self.assertNotIn("Custos 团队周报", hidden_skill)
+            config = json.loads(archive.read("mcp.json"))
+        self.assertNotIn("Custos 团队周报", skill)
         self.assertNotIn("Custos 团队周报", visible_skill)
-        self.assertEqual(hidden_skill, visible_skill)
-        self.assertEqual(config["mcp"]["servers"]["custos"]["url"], "http://localhost:8000/mcp")
+        self.assertEqual(skill, visible_skill)
+        self.assertEqual(config["mcpServers"]["custos"]["url"], "http://localhost:8000/mcp")
+        self.assertEqual(config["mcpServers"]["custos"]["type"], "streamableHttp")
         self.assertNotIn("X-Model-Bypass", json.dumps(config))
 
     def test_mock_skill_generation_handles_contacts(self):
         generated = GENERATOR.mock_generate("创建查看 Custos 团队联系人列表和读取邮箱的 Skill")
         self.assertEqual(generated["required_env_vars"], ["CUSTOS_CONTACTS_DIR"])
         self.assertEqual(generated["skill_id"], "custos-team-contacts")
+
+    def test_mock_test_questions_use_skill_definition_and_guidance(self):
+        skill = SKILLS.effective("weekly-report", UserContext("alice", "custos-team"))["data"]
+        questions, mode = GENERATOR.generate_test_questions(skill, "重点测试缺失信息")
+        self.assertEqual(mode, "mock")
+        self.assertEqual(len(questions), 3)
+        self.assertTrue(any("周报" in question for question in questions))
+        self.assertTrue(any("缺失信息" in question for question in questions))
+
+    def test_mcp_tool_calls_are_logged_without_recording_code(self):
+        user = UserContext("alice", "custos-team")
+        mcp_call("get_skill_config", {"skill_id": "custos-team-contacts"}, user)
+        source = "print('do not store source')"
+        result = mcp_call("run_code", {"skill_id": "custos-team-contacts", "code": source}, user)
+        self.assertFalse(result.get("isError", False))
+        tool_calls = [row for row in STORE.audit if row["action_type"] == "tool_call"]
+        self.assertEqual([row["tool_name"] for row in tool_calls], ["get_skill_config", "run_code"])
+        run_call = tool_calls[-1]
+        self.assertNotIn(source, json.dumps(run_call))
+        self.assertEqual(run_call["input_snapshot"]["code_bytes"], len(source.encode()))
 
 
 if __name__ == "__main__":

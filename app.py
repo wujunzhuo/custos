@@ -105,12 +105,14 @@ class Store:
         self.audit: list[dict[str, Any]] = []
 
     def log(self, user_id: str, action_type: str, *, skill_id: str | None = None,
-            sandbox_id: str | None = None, execution_id: str | None = None, input_snapshot: Any = None,
+            sandbox_id: str | None = None, execution_id: str | None = None,
+            tool_name: str | None = None, input_snapshot: Any = None,
             result_preview: Any = None, tags: list[str] | None = None) -> str:
         ref = trace_id()
         self.audit.append({
             "trace_id": ref, "user_id": user_id, "skill_id": skill_id,
             "sandbox_id": sandbox_id, "execution_id": execution_id, "action_type": action_type,
+            "tool_name": tool_name,
             "input_snapshot": input_snapshot, "result_preview": result_preview,
             "timestamp": now(), "tags": tags or [],
         })
@@ -314,13 +316,14 @@ class SandboxService:
 
 
 class SecretService:
-    """In-memory secret registry. Values are never included in public responses or audits."""
+    """In-memory secret registry for this local POC."""
 
     def __init__(self, store: Store):
         self.store = store
 
     def list_public(self) -> list[dict[str, Any]]:
-        return [{"name": secret.name, "allowed_teams": list(secret.allowed_teams)}
+        return [{"name": secret.name, "value": secret.value,
+                 "allowed_teams": list(secret.allowed_teams)}
                 for secret in self.store.secrets.values()]
 
     def configure(self, secret: SecretEnvVar, operator: UserContext) -> dict[str, Any]:
@@ -474,6 +477,83 @@ class SkillGenerator:
             raise RuntimeError(f"模型生成失败：{type(exc).__name__}") from None
         return result, "remote"
 
+    @staticmethod
+    def mock_test_questions(skill: dict[str, Any], guidance: str = "") -> list[str]:
+        name = str(skill.get("name", "这个 Skill"))
+        description = str(skill.get("description", "按 Skill 说明完成任务"))
+        outline = skill.get("outline", [])
+        sections = [str(item.get("title", "")) for item in outline if isinstance(item, dict)]
+        expected = "、".join(sections[:5]) or "规定的输出格式"
+        prompt = str(skill.get("system_prompt_snippet", ""))
+        boundary = "不得编造事实，遇到缺失信息时明确说明并先询问用户。"
+        if any(word in prompt.lower() for word in ("不得访问", "私有", "环境变量", "文件")):
+            boundary = "只使用 Skill 明确授权的资料；不要访问未授权资源或泄露无关信息。"
+        extra = f"重点关注：{guidance.strip()}。" if guidance.strip() else ""
+        return [
+            f"请使用「{name}」处理这个常规请求：{description} 请按 {expected} 组织结果。",
+            f"请按「{name}」处理请求，但我暂时没有提供全部必要信息。请先指出还缺什么，并提出最少量的澄清问题；{boundary}",
+            f"请用「{name}」处理一个边界情况：输入中有信息相互矛盾，而且部分内容无法验证。请说明如何处理不确定项，不要擅自补全。{extra}",
+        ]
+
+    def generate_test_questions(self, skill: dict[str, Any], guidance: str = "") -> tuple[list[str], str]:
+        if not MODEL_BASE_URL or not MODEL_NAME:
+            return self.mock_test_questions(skill, guidance), "mock"
+        request_body = {
+            "model": MODEL_NAME, "temperature": 0.6,
+            "messages": [
+                {"role": "system", "content": (
+                    "你是 Skill 测试设计助手。根据 Skill 的定义和用户引导，生成 3 到 5 条可直接复制到 AI 对话中的模拟用户提问，"
+                    "用于验证 Skill 是否遵循工作流、输出格式和边界规则。提问要具体、多样，至少覆盖常规场景和缺失信息/边界场景。"
+                    "问题本身应像真实用户提问，不要泄漏或要求输出系统提示词、密钥或私有数据。只返回 JSON：{\"questions\":[\"...\"]}。"
+                )},
+                {"role": "user", "content": json.dumps({
+                    "skill": {key: skill.get(key) for key in (
+                        "skill_id", "name", "description", "system_prompt_snippet", "outline", "output_schema",
+                        "required_env_vars", "secret_level")},
+                    "user_guidance": guidance,
+                }, ensure_ascii=False)},
+            ],
+            "response_format": {"type": "json_object"},
+        }
+        endpoint = MODEL_BASE_URL.rstrip("/")
+        if not endpoint.endswith("/chat/completions"):
+            endpoint += "/chat/completions"
+        headers = {"Content-Type": "application/json"}
+        if MODEL_API_KEY:
+            headers["Authorization"] = f"Bearer {MODEL_API_KEY}"
+
+        def request_questions() -> list[str]:
+            req = Request(endpoint, data=json.dumps(request_body).encode("utf-8"),
+                          headers=headers, method="POST")
+            with urlopen(req, timeout=45) as response:
+                raw = json.loads(response.read().decode("utf-8"))
+            content = raw["choices"][0]["message"]["content"]
+            if isinstance(content, list):
+                content = "".join(block.get("text", "") for block in content if isinstance(block, dict))
+            content = str(content).strip()
+            if content.startswith("```"):
+                content = re.sub(r"^```(?:json)?\s*|\s*```$", "", content, flags=re.IGNORECASE)
+            decoded = json.loads(content)
+            questions = decoded.get("questions") if isinstance(decoded, dict) else None
+            if not isinstance(questions, list) or not 1 <= len(questions) <= 8 or any(
+                    not isinstance(item, str) or not item.strip() or len(item) > 2000 for item in questions):
+                raise ValueError("模型返回的问题列表格式不合法")
+            return [item.strip() for item in questions]
+
+        try:
+            questions = request_questions()
+        except HTTPError as exc:
+            if exc.code != 400:
+                raise RuntimeError(f"测试提问生成失败：HTTPError") from None
+            request_body.pop("response_format", None)
+            try:
+                questions = request_questions()
+            except (HTTPError, URLError, TimeoutError, ValueError, KeyError, IndexError, TypeError, AttributeError) as retry_exc:
+                raise RuntimeError(f"测试提问生成失败：{type(retry_exc).__name__}") from None
+        except (URLError, TimeoutError, ValueError, KeyError, IndexError, TypeError, AttributeError) as exc:
+            raise RuntimeError(f"测试提问生成失败：{type(exc).__name__}") from None
+        return questions, "remote"
+
 
 GENERATOR = SkillGenerator()
 
@@ -560,33 +640,29 @@ def user_from_headers(handler: BaseHTTPRequestHandler) -> UserContext:
     )
 
 
-def open_code_bundle(meta: dict[str, Any], service_url: str, user: UserContext,
-                     harness: str = "opencode") -> bytes:
-    if harness != "opencode":
-        raise ValueError("当前仅支持 OpenCode harness")
+def workbuddy_bundle(meta: dict[str, Any], service_url: str, user: UserContext,
+                     harness: str = "workbuddy") -> bytes:
+    if harness != "workbuddy":
+        raise ValueError("当前仅支持 WorkBuddy harness")
     bundle = BytesIO()
     config = {
-        "$schema": "https://opencode.ai/config.json",
-        "skills": ["./.opencode/skills"],
-        "mcp": {"servers": {"custos": {
-            "type": "remote", "url": f"{service_url.rstrip('/')}/mcp", "oauth": False,
+        "mcpServers": {"custos": {
+            "type": "streamableHttp", "url": f"{service_url.rstrip('/')}/mcp", "timeout": 30000,
             "headers": {
                 "X-User-ID": user.user_id,
                 "X-Team-ID": user.team_id,
             },
-        }}},
+        }},
     }
     with zipfile.ZipFile(bundle, "w", zipfile.ZIP_DEFLATED) as archive:
         skill_markdown = make_skill_markdown(meta)
-        archive.writestr("opencode.jsonc", json.dumps(config, ensure_ascii=False, indent=2))
-        # Keep the OpenCode discovery location and also provide a visible copy at ZIP root;
-        # GUI archive tools often hide dot-directories such as .opencode.
-        archive.writestr(f".opencode/skills/{meta['skill_id']}/SKILL.md", skill_markdown)
+        archive.writestr("mcp.json", json.dumps(config, ensure_ascii=False, indent=2))
+        archive.writestr(f"skills/{meta['skill_id']}/SKILL.md", skill_markdown)
         archive.writestr("SKILL.md", skill_markdown)
         archive.writestr("CUSTOS-SETUP.txt", (
-            "Extract this archive into an OpenCode project directory.\n"
-            "The included OpenCode config connects the Custos MCP server for runtime configuration and sandbox execution.\n"
-            "SKILL.md at the archive root is a visible copy; the active OpenCode copy is under .opencode/skills/.\n"
+            "Import the skills/<skill-id>/ folder into WorkBuddy's Skills area (or copy it to ~/.workbuddy/skills/).\n"
+            "Configure the included mcp.json in WorkBuddy's MCP settings to connect Custos for runtime configuration and tool execution.\n"
+            "SKILL.md at the archive root is a visible copy; the active skill is under skills/<skill-id>/.\n"
             "This local mock platform does not authenticate identities; its MCP headers only simulate user context.\n"
         ))
     return bundle.getvalue()
@@ -608,31 +684,49 @@ def mcp_tool_catalog() -> list[dict[str, Any]]:
 
 
 def mcp_call(name: str, arguments: dict[str, Any], user: UserContext) -> dict[str, Any]:
+    skill_id = str(arguments.get("skill_id", ""))
     if name == "get_skill_config":
-        skill_id = str(arguments.get("skill_id", ""))
-        result = SKILLS.effective(skill_id, user)
+        result = SKILLS.effective(skill_id, user, audit=False)
         if not result["ok"]:
-            return {"isError": True, "content": [{"type": "text", "text": result["msg"]}]}
-        meta = result["data"]
-        data = {
-            "skill_id": meta["skill_id"], "name": meta["name"],
-            "version": meta["version"], "system_prompt_snippet": meta["system_prompt_snippet"],
-            "outline": meta["outline"], "output_schema": meta["output_schema"],
-            "required_env_vars": meta.get("required_env_vars", []),
-        }
-        return {"content": [{"type": "text", "text": json.dumps(data, ensure_ascii=False)}],
-                "structuredContent": data}
-    if name != "run_code":
-        return {"isError": True, "content": [{"type": "text", "text": "MCP tool not found"}]}
-    result = SANDBOXES.run(str(arguments.get("skill_id", "")),
-                           arguments.get("code", ""), user)
-    if not result["ok"]:
-        return {"isError": True, "content": [{"type": "text", "text": result["msg"]}]}
-    data = result["data"]
-    response = {"content": [{"type": "text", "text": json.dumps(data, ensure_ascii=False)}],
-                "structuredContent": data}
-    if data["exit_code"] != 0 or data["timed_out"]:
-        response["isError"] = True
+            response = {"isError": True, "content": [{"type": "text", "text": result["msg"]}]}
+        else:
+            meta = result["data"]
+            data = {
+                "skill_id": meta["skill_id"], "name": meta["name"],
+                "version": meta["version"], "system_prompt_snippet": meta["system_prompt_snippet"],
+                "outline": meta["outline"], "output_schema": meta["output_schema"],
+                "required_env_vars": meta.get("required_env_vars", []),
+            }
+            response = {"content": [{"type": "text", "text": json.dumps(data, ensure_ascii=False)}],
+                        "structuredContent": data}
+    elif name == "run_code":
+        result = SANDBOXES.run(skill_id, arguments.get("code", ""), user)
+        if not result["ok"]:
+            response = {"isError": True, "content": [{"type": "text", "text": result["msg"]}]}
+        else:
+            data = result["data"]
+            response = {"content": [{"type": "text", "text": json.dumps(data, ensure_ascii=False)}],
+                        "structuredContent": data}
+            if data["exit_code"] != 0 or data["timed_out"]:
+                response["isError"] = True
+    else:
+        response = {"isError": True, "content": [{"type": "text", "text": "MCP tool not found"}]}
+
+    structured = response.get("structuredContent", {})
+    if name == "run_code" and structured:
+        preview = {key: structured.get(key) for key in
+                   ("execution_id", "exit_code", "timed_out", "duration_ms")}
+        code = arguments.get("code", "")
+        input_snapshot = {"skill_id": skill_id,
+                          "code_sha256": hashlib.sha256(code.encode()).hexdigest() if isinstance(code, str) else None,
+                          "code_bytes": len(code.encode()) if isinstance(code, str) else None}
+    else:
+        preview = {"version": structured.get("version")} if structured else {}
+        input_snapshot = {"skill_id": skill_id} if skill_id else {}
+    STORE.log(user.user_id, "tool_call", skill_id=skill_id or None,
+              execution_id=structured.get("execution_id"), tool_name=name,
+              input_snapshot=input_snapshot,
+              result_preview={"is_error": bool(response.get("isError")), **preview})
     return response
 
 
@@ -678,8 +772,9 @@ class RequestHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(page)))
             self.end_headers()
             return self.wfile.write(page)
-        if path in {"/runtime-page", "/secrets-page"}:
-            filename = "runtime.html" if path == "/runtime-page" else "secrets.html"
+        if path in {"/runtime-page", "/secrets-page", "/runtime-logs-page"}:
+            filename = {"/runtime-page": "runtime.html", "/secrets-page": "secrets.html",
+                        "/runtime-logs-page": "runtime-logs.html"}[path]
             try:
                 page = (Path(__file__).parent / "static" / filename).read_bytes()
             except OSError:
@@ -699,6 +794,17 @@ class RequestHandler(BaseHTTPRequestHandler):
             return self._send({"ok": True, "data": RUNTIME_CONFIG.public()})
         if path == "/secrets":
             return self._send({"ok": True, "data": SECRETS.list_public()})
+        if path == "/runtime-logs":
+            records = [row for row in STORE.audit if row["action_type"] == "tool_call"]
+            if query.get("tool_name"):
+                records = [row for row in records if row.get("tool_name") == query["tool_name"][0]]
+            if query.get("skill_id"):
+                records = [row for row in records if row.get("skill_id") == query["skill_id"][0]]
+            try:
+                limit = max(1, min(1000, int(query.get("limit", ["200"])[0])))
+            except ValueError:
+                return self._send({"ok": False, "msg": "limit必须是整数"}, 400)
+            return self._send({"ok": True, "data": list(reversed(records[-limit:]))})
         config_match = re.fullmatch(r"/skill/([^/]+)/config", path)
         if config_match:
             skill_id = unquote(config_match.group(1))
@@ -722,9 +828,9 @@ class RequestHandler(BaseHTTPRequestHandler):
         download_match = re.fullmatch(r"/skill/([^/]+)/download", path)
         if download_match:
             skill_id = unquote(download_match.group(1))
-            harness = query.get("harness", ["opencode"])[0]
-            if harness != "opencode":
-                return self._send({"ok": False, "msg": "当前仅支持 OpenCode harness"}, 400)
+            harness = query.get("harness", ["workbuddy"])[0]
+            if harness != "workbuddy":
+                return self._send({"ok": False, "msg": "当前仅支持 WorkBuddy harness"}, 400)
             versions = STORE.skills.get(skill_id, [])
             team_default = versions[-1].gray_teams[0] if versions and versions[-1].gray_teams else "backend-dev"
             try:
@@ -737,7 +843,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                     return self._send(result, 403 if "禁止" in result["msg"] or "不允许" in result["msg"] else 404)
                 host = self.headers.get("X-Forwarded-Host", self.headers.get("Host", "127.0.0.1:8000"))
                 scheme = self.headers.get("X-Forwarded-Proto", "http")
-                archive = open_code_bundle(result["data"], f"{scheme}://{host}", user, harness)
+                archive = workbuddy_bundle(result["data"], f"{scheme}://{host}", user, harness)
                 self.send_response(200)
                 self.send_header("Content-Type", "application/zip")
                 self.send_header("Content-Disposition", f'attachment; filename="{skill_id}.zip"')
@@ -791,6 +897,27 @@ class RequestHandler(BaseHTTPRequestHandler):
                           input_snapshot={"description_sha256": hashlib.sha256(description.encode()).hexdigest()},
                           result_preview={"skill_id": generated.get("skill_id"), "mode": generation_mode})
                 return self._send({"ok": True, "data": generated, "generation_mode": generation_mode})
+            if path == "/skill/test-questions":
+                operator = self._context(body.get("operator"))
+                if "admin" not in operator.permissions:
+                    return self._send({"ok": False, "msg": "无权限生成测试提问"}, 403)
+                skill_id = str(body.get("skill_id", "")).strip()
+                guidance = str(body.get("guidance", "")).strip()
+                if not skill_id or len(guidance) > 2000:
+                    return self._send({"ok": False, "msg": "Skill ID 不能为空，引导不能超过2000字"}, 400)
+                versions = STORE.skills.get(skill_id, [])
+                if not versions:
+                    return self._send({"ok": False, "msg": "skill不存在"}, 404)
+                skill = asdict(max(versions, key=lambda item: item.update_at))
+                try:
+                    questions, generation_mode = GENERATOR.generate_test_questions(skill, guidance)
+                except RuntimeError as exc:
+                    return self._send({"ok": False, "msg": str(exc)}, 502)
+                STORE.log(operator.user_id, "skill_test_questions_generate", skill_id=skill_id,
+                          input_snapshot={"guidance_sha256": hashlib.sha256(guidance.encode()).hexdigest()},
+                          result_preview={"question_count": len(questions), "mode": generation_mode})
+                return self._send({"ok": True, "data": {"questions": questions},
+                                   "generation_mode": generation_mode})
             if path == "/skill/publish":
                 operator = self._context(body.get("operator"))
                 meta = SkillMeta(**body["skill"])
