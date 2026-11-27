@@ -35,7 +35,7 @@
     <div class="modal-head"><div><h2 id="modal-title">新建托管 Skill</h2><span class="hint">先描述需求，由模型生成初稿；确认并手动修改后再发布。</span></div><button class="close" id="close-modal" aria-label="关闭">×</button></div>
     <div class="modal-body">
       <div class="notice" id="notice"></div>
-      <section id="generate-step" class="step"><div class="step-title">① 用自然语言描述 Skill 需求</div><div class="field"><textarea id="requirement" placeholder="例如：创建一个 Custos 通讯录 Skill，使用 CUSTOS_CONTACTS_DIR 查看联系人文件列表并读取联系人邮箱。"></textarea></div><button class="primary" id="generate" type="button">✦ AI 生成 Skill 草稿</button><span class="hint" id="generation-mode" style="margin-left:9px"></span></section>
+      <section id="generate-step" class="step"><div class="step-title">① 用自然语言描述 Skill 需求</div><div class="field"><textarea id="requirement" placeholder="例如：创建一个 Custos 通讯录 Skill，使用 CUSTOS_CONTACTS_CSV 读取联系人并查找邮箱。"></textarea></div><button class="primary" id="generate" type="button">✦ AI 生成 Skill 草稿</button><span class="hint" id="generation-mode" style="margin-left:9px"></span></section>
       <form id="skill-form" style="display:none">
         <div class="step-title">② 检查并手动修改生成结果</div>
         <div class="grid2"><div class="field"><label for="skill-id">Skill ID</label><input id="skill-id" required pattern="[a-z0-9]+(-[a-z0-9]+)*"></div><div class="field"><label for="skill-name">名称</label><input id="skill-name" required></div></div>
@@ -43,7 +43,7 @@
         <div class="field"><label for="skill-prompt">远程 Prompt / 规则</label><textarea id="skill-prompt" required></textarea></div>
         <div class="field"><label for="skill-outline">输出大纲 JSON</label><textarea id="skill-outline"></textarea></div>
         <div class="field"><label for="skill-schema">输出 Schema JSON</label><textarea id="skill-schema"></textarea></div>
-        <div class="field"><label for="skill-env">需要的环境变量名（逗号分隔）</label><input id="skill-env" placeholder="CUSTOS_CONTACTS_DIR"><div class="hint">这里只声明名称；变量值在环境变量页面配置。</div></div>
+        <div class="field"><label for="skill-env">需要的环境变量名（逗号分隔）</label><input id="skill-env" placeholder="CUSTOS_CONTACTS_CSV"><div class="hint">这里只声明名称；变量值在环境变量页面配置。</div></div>
         <div class="form-actions"><span></span><div><button class="secondary" id="back-generate" type="button">返回描述</button> <button class="primary" type="submit">保存 Skill</button></div></div>
       </form>
     </div>

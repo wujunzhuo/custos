@@ -11,7 +11,7 @@ Custos 是单进程、零第三方依赖的 Python 原型，用于验证 Skill �
 初始化示例：
 
 1. **周报助手**：服务端运行时 Prompt 要求输出标题“Custos 周报”。标题不在客户端下载的 `SKILL.md` 中，展示远程 Prompt 变更无需重新下载。
-2. **Custos 通讯录**：服务启动时在临时目录创建包含约 20 位不同岗位联系人的假 CSV，`CUSTOS_CONTACTS_DIR` 保存该目录的绝对路径。Skill 声明该变量，并通过 `run_code` 列出目录文件和读取联系人。
+2. **Custos 通讯录**：服务启动时在临时位置创建包含约 20 位不同岗位联系人的假 CSV 文件，`CUSTOS_CONTACTS_CSV` 保存文件的绝对路径。Skill 声明该变量，并通过 `run_code` 读取和查找联系人。
 
 下载 ZIP 按所选 Agent 工具生成对应目录结构和 MCP 配置。WorkBuddy 包含 `skills/<skill-id>/SKILL.md` 与 `mcp.json`；OpenCode 包含 `.opencode/skills/<skill-id>/SKILL.md` 与 `opencode.jsonc`。两者均附有根目录可见的 `SKILL.md` 副本。Agent 通过 MCP 获取服务端最新 Skill 配置，并调用通用 `run_code` 工具。工具执行仅用于演示 MCP 调用流程，不是隔离沙箱。
 
@@ -52,7 +52,7 @@ WorkBuddy 必须能访问 Custos 的服务地址。如果 WorkBuddy 不在运行
 python3 app.py
 ```
 
-访问 <http://127.0.0.1:8000/>。服务重启后 Skill、变量和审计记录重置，示例联系人临时目录会随服务退出清理。
+访问 <http://127.0.0.1:8000/>。服务重启后 Skill、变量和审计记录重置，示例联系人临时 CSV 文件会随服务退出清理。
 
 若要使用 OpenAI-compatible 模型生成 Skill，在启动前设置：
 

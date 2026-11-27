@@ -22,27 +22,27 @@ class CustosTests(unittest.TestCase):
         weekly = fresh_skills.effective("weekly-report", UserContext("staff"))["data"]
         self.assertIn("Custos 周报", weekly["system_prompt_snippet"])
         self.assertNotIn("secret_level", weekly)
-        contacts = Path(fresh_store.secrets["CUSTOS_CONTACTS_DIR"].value)
+        contacts = Path(fresh_store.secrets["CUSTOS_CONTACTS_CSV"].value)
         self.assertTrue(contacts.is_absolute())
-        self.assertTrue((contacts / "custos_contacts.csv").is_file())
-        with (contacts / "custos_contacts.csv").open(encoding="utf-8", newline="") as source:
+        self.assertTrue(contacts.is_file())
+        with contacts.open(encoding="utf-8", newline="") as source:
             people = list(csv.DictReader(source))
         self.assertEqual(len(people), 20)
         self.assertGreaterEqual(len({person["role"] for person in people}), 18)
 
-    def test_contact_skill_lists_and_reads_startup_temp_directory(self):
+    def test_contact_skill_reads_startup_temp_csv_file(self):
         code = (
             "import os\nfrom pathlib import Path\n"
-            "root=Path(os.environ['CUSTOS_CONTACTS_DIR'])\n"
-            "print('FILES:', ','.join(sorted(p.name for p in root.iterdir() if p.is_file())))\n"
-            "print((root/'custos_contacts.csv').read_text())\n"
+            "contacts=Path(os.environ['CUSTOS_CONTACTS_CSV'])\n"
+            "print(contacts.name)\n"
+            "print(contacts.read_text())\n"
         )
         result = TOOL_EXECUTOR.run("custos-contacts", code, UserContext("alice"))
         self.assertTrue(result["ok"])
         self.assertEqual(result["data"]["exit_code"], 0)
-        self.assertIn("custos_contacts.csv", result["data"]["stdout"])
+        self.assertIn("custos-contacts-", result["data"]["stdout"])
         self.assertIn("lin.chen@custos.example", result["data"]["stdout"])
-        self.assertIn("injected_env_names:CUSTOS_CONTACTS_DIR", STORE.audit[-1]["tags"])
+        self.assertIn("injected_env_names:CUSTOS_CONTACTS_CSV", STORE.audit[-1]["tags"])
 
     def test_unrequested_environment_variables_are_not_injected(self):
         admin = UserContext("admin", permissions=["admin"])
@@ -117,11 +117,11 @@ class CustosTests(unittest.TestCase):
     def test_mcp_skill_config_and_generic_tool_runner(self):
         user = UserContext("alice")
         config = mcp_call("get_skill_config", {"skill_id": "custos-contacts"}, user)
-        self.assertEqual(config["structuredContent"]["required_env_vars"], ["CUSTOS_CONTACTS_DIR"])
+        self.assertEqual(config["structuredContent"]["required_env_vars"], ["CUSTOS_CONTACTS_CSV"])
         self.assertNotIn("version", config["structuredContent"])
         result = mcp_call("run_code", {
             "skill_id": "custos-contacts",
-            "code": "import os; print(os.path.isabs(os.environ['CUSTOS_CONTACTS_DIR']))",
+            "code": "import os; print(os.path.isfile(os.environ['CUSTOS_CONTACTS_CSV']))",
         }, user)
         self.assertFalse(result.get("isError", False))
         self.assertIn("True", result["structuredContent"]["stdout"])
@@ -156,7 +156,7 @@ class CustosTests(unittest.TestCase):
 
     def test_mock_skill_generation_handles_contacts(self):
         generated = GENERATOR.mock_generate("创建查看 Custos 联系人列表和读取邮箱的 Skill")
-        self.assertEqual(generated["required_env_vars"], ["CUSTOS_CONTACTS_DIR"])
+        self.assertEqual(generated["required_env_vars"], ["CUSTOS_CONTACTS_CSV"])
         self.assertEqual(generated["skill_id"], "custos-contacts")
         self.assertNotIn("secret_level", generated)
 

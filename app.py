@@ -9,7 +9,6 @@ import atexit
 import os
 import re
 import signal
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -293,7 +292,7 @@ class SkillGenerator:
                        {"title": "下周计划", "guidance": "按优先级列出计划和交付物。"}]
         elif contacts:
             name, skill_id = "Custos 通讯录", "custos-contacts"
-            outline = [{"title": "可用文件"}, {"title": "匹配联系人"}, {"title": "联系信息"}]
+            outline = [{"title": "匹配联系人"}, {"title": "联系信息"}]
         else:
             name, skill_id = "自定义 Skill", "custom-skill"
             outline = [{"title": "任务理解"}, {"title": "执行结果"}, {"title": "待确认事项"}]
@@ -302,7 +301,7 @@ class SkillGenerator:
             "system_prompt_snippet": f"你是{name}。根据以下需求完成任务：{description}\n遵循输出大纲，不编造未提供的事实。",
             "outline": outline,
             "output_schema": {"type": "object", "required": [part["title"] for part in outline]},
-            "required_env_vars": ["CUSTOS_CONTACTS_DIR"] if contacts else [],
+            "required_env_vars": ["CUSTOS_CONTACTS_CSV"] if contacts else [],
         }
 
     @staticmethod
@@ -451,34 +450,34 @@ def build_app() -> tuple[Store, SkillService, ToolExecutionService, SecretServic
     tool_executor = ToolExecutionService(store, skills)
     secrets = SecretService(store)
     admin = UserContext("seed-admin", permissions=["admin"])
-    contacts_dir = tempfile.mkdtemp(prefix="custos-contacts-")
-    atexit.register(shutil.rmtree, contacts_dir, ignore_errors=True)
-    contacts_file = Path(contacts_dir) / "custos_contacts.csv"
-    contacts_file.write_text(
-        "name,department,role,email\n"
-        "Lin Chen,Custos Platform,Platform Lead,lin.chen@custos.example\n"
-        "Mei Wang,Product,Product Manager,mei.wang@custos.example\n"
-        "Alex Kim,Engineering,Backend Engineer,alex.kim@custos.example\n"
-        "Rui Zhang,People Operations,People Partner,rui.zhang@custos.example\n"
-        "Jia Liu,Design,UX Designer,jia.liu@custos.example\n"
-        "Omar Hassan,Security,Security Engineer,omar.hassan@custos.example\n"
-        "Priya Patel,Data,Data Scientist,priya.patel@custos.example\n"
-        "Noah Williams,Finance,Finance Analyst,noah.williams@custos.example\n"
-        "Sofia Garcia,Marketing,Marketing Manager,sofia.garcia@custos.example\n"
-        "Ethan Brown,Sales,Account Executive,ethan.brown@custos.example\n"
-        "Yuki Tanaka,Customer Support,Support Specialist,yuki.tanaka@custos.example\n"
-        "Amara Okafor,Legal,Legal Counsel,amara.okafor@custos.example\n"
-        "Mateo Rossi,Quality,QA Engineer,mateo.rossi@custos.example\n"
-        "Chloe Dubois,Infrastructure,DevOps Engineer,chloe.dubois@custos.example\n"
-        "Arjun Mehta,AI Research,Machine Learning Engineer,arjun.mehta@custos.example\n"
-        "Emma Wilson,Documentation,Technical Writer,emma.wilson@custos.example\n"
-        "Diego Silva,Procurement,Procurement Specialist,diego.silva@custos.example\n"
-        "Hana Suzuki,Mobile,Mobile Developer,hana.suzuki@custos.example\n"
-        "Grace Lee,Operations,Operations Manager,grace.lee@custos.example\n"
-        "Lucas Martin,Solutions,Solutions Architect,lucas.martin@custos.example\n",
-        encoding="utf-8",
-    )
-    secrets.configure(SecretEnvVar(name="CUSTOS_CONTACTS_DIR", value=contacts_dir), admin)
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline="", suffix=".csv",
+                                     prefix="custos-contacts-", delete=False) as contacts_file:
+        contacts_path = Path(contacts_file.name)
+        contacts_file.write(
+            "name,department,role,email\n"
+            "Lin Chen,Custos Platform,Platform Lead,lin.chen@custos.example\n"
+            "Mei Wang,Product,Product Manager,mei.wang@custos.example\n"
+            "Alex Kim,Engineering,Backend Engineer,alex.kim@custos.example\n"
+            "Rui Zhang,People Operations,People Partner,rui.zhang@custos.example\n"
+            "Jia Liu,Design,UX Designer,jia.liu@custos.example\n"
+            "Omar Hassan,Security,Security Engineer,omar.hassan@custos.example\n"
+            "Priya Patel,Data,Data Scientist,priya.patel@custos.example\n"
+            "Noah Williams,Finance,Finance Analyst,noah.williams@custos.example\n"
+            "Sofia Garcia,Marketing,Marketing Manager,sofia.garcia@custos.example\n"
+            "Ethan Brown,Sales,Account Executive,ethan.brown@custos.example\n"
+            "Yuki Tanaka,Customer Support,Support Specialist,yuki.tanaka@custos.example\n"
+            "Amara Okafor,Legal,Legal Counsel,amara.okafor@custos.example\n"
+            "Mateo Rossi,Quality,QA Engineer,mateo.rossi@custos.example\n"
+            "Chloe Dubois,Infrastructure,DevOps Engineer,chloe.dubois@custos.example\n"
+            "Arjun Mehta,AI Research,Machine Learning Engineer,arjun.mehta@custos.example\n"
+            "Emma Wilson,Documentation,Technical Writer,emma.wilson@custos.example\n"
+            "Diego Silva,Procurement,Procurement Specialist,diego.silva@custos.example\n"
+            "Hana Suzuki,Mobile,Mobile Developer,hana.suzuki@custos.example\n"
+            "Grace Lee,Operations,Operations Manager,grace.lee@custos.example\n"
+            "Lucas Martin,Solutions,Solutions Architect,lucas.martin@custos.example\n"
+        )
+    atexit.register(contacts_path.unlink, missing_ok=True)
+    secrets.configure(SecretEnvVar(name="CUSTOS_CONTACTS_CSV", value=str(contacts_path)), admin)
     skills.publish(SkillMeta(
         skill_id="weekly-report", name="Custos 周报助手", description="根据用户提供的信息整理周报。",
         system_prompt_snippet="你是 Custos 周报助手。请基于用户提供的信息整理周报，不要编造事实；缺失内容明确标注待补充。最终文档第一行必须精确使用标题：Custos 周报。该标题是服务端托管模板的一部分。",
@@ -488,11 +487,11 @@ def build_app() -> tuple[Store, SkillService, ToolExecutionService, SecretServic
                  {"title": "下周计划", "guidance": "按优先级列出下周计划和预期交付。"}],
         ), admin)
     skills.publish(SkillMeta(
-        skill_id="custos-contacts", name="Custos 通讯录", description="列出并读取 Custos 企业联系人目录。",
-        system_prompt_snippet="你可以使用一次性 Python 子进程读取企业通讯录。运行时环境变量 CUSTOS_CONTACTS_DIR 是允许访问的绝对目录。需要先用 pathlib.Path(os.environ['CUSTOS_CONTACTS_DIR']).iterdir() 列出目录文件，再按需读取其中的 CSV 文件并查找联系人姓名、部门、职位或邮箱。不得访问该目录之外的文件；不得虚构或泄露与用户请求无关的联系人信息。",
-        output_schema={"type": "object", "required": ["files", "contacts"]},
-        outline=[{"title": "可用文件"}, {"title": "匹配联系人"}, {"title": "联系信息"}],
-        required_env_vars=["CUSTOS_CONTACTS_DIR"]), admin)
+        skill_id="custos-contacts", name="Custos 通讯录", description="读取并查询 Custos 企业联系人 CSV。",
+        system_prompt_snippet="使用一次性 Python 子进程读取企业通讯录。环境变量 CUSTOS_CONTACTS_CSV 是联系人 CSV 文件的绝对路径。使用 pathlib.Path(os.environ['CUSTOS_CONTACTS_CSV']).read_text() 读取文件，再按需查找联系人姓名、部门、职位或邮箱。不得虚构或泄露与用户请求无关的联系人信息。",
+        output_schema={"type": "object", "required": ["contacts"]},
+        outline=[{"title": "匹配联系人"}, {"title": "联系信息"}],
+        required_env_vars=["CUSTOS_CONTACTS_CSV"]), admin)
     # Startup fixtures are not user actions; keep the audit view focused on runtime activity.
     store.audit.clear()
     return store, skills, tool_executor, secrets
