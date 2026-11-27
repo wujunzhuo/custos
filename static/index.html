@@ -16,7 +16,7 @@
 <body>
   <header><div class="brand"><span class="logo">C</span>Custos</div><nav class="nav"><a class="active" href="/">Skill 管理</a><a href="/secrets-page">环境变量</a><a href="/runtime-logs-page">运行时日志</a></nav></header>
   <main>
-    <div class="titlebar"><div><div class="eyebrow">MANAGED SKILLS</div><h1>Skill 管理</h1><p>创建并发布托管 Skill，下载到 WorkBuddy；运行时指令由服务端配置。</p></div><div class="actions"><label class="badge" for="harness">导出 Harness</label><select id="harness"><option value="workbuddy">WorkBuddy</option></select><button class="primary" id="new-skill">＋ 新建 Skill</button></div></div>
+    <div class="titlebar"><div><div class="eyebrow">MANAGED SKILLS</div><h1>Skill 管理</h1><p>创建并发布托管 Skill，下载时可为每个 Skill 单独选择 Agent 工具。</p></div><div class="actions"><button class="primary" id="new-skill">＋ 新建 Skill</button></div></div>
     <div class="model-status">Skill 生成模型：<span class="pill" id="model-status">读取配置…</span> <span id="model-detail"></span></div>
     <section class="card"><div class="toolbar"><div><strong>已发布 Skills</strong><br><span>服务端管理运行时模板；修改后发布新版本</span></div><span id="skill-count"></span></div>
       <div class="table-wrap"><table><thead><tr><th>名称 / ID</th><th>版本</th><th>描述</th><th>运行时环境变量</th><th>灰度范围</th><th>操作</th></tr></thead><tbody id="skill-rows"><tr><td colspan="6" class="empty">加载中…</td></tr></tbody></table></div>
@@ -41,7 +41,7 @@
     </div>
   </dialog>
   <dialog id="question-dialog">
-    <div class="modal-head"><div><h2 id="question-title">生成 Skill 测试提问</h2><span class="hint">根据已发布的 Skill 规则生成模拟用户问题，复制后到 WorkBuddy 对话中测试。</span></div><button class="close" id="close-question" aria-label="关闭">×</button></div>
+      <div class="modal-head"><div><h2 id="question-title">生成 Skill 测试提问</h2><span class="hint">根据已发布的 Skill 规则生成模拟用户问题，复制后到对应 Agent 对话中测试。</span></div><button class="close" id="close-question" aria-label="关闭">×</button></div>
     <div class="modal-body">
       <div class="notice" id="question-notice"></div>
       <div class="field"><label for="question-guidance">用户引导（可选）</label><textarea id="question-guidance" placeholder="例如：重点测试用户信息不足、输出格式和权限边界；问题要贴近真实业务场景。"></textarea><div class="hint">AI 会结合 Skill 描述、运行时规则、输出大纲与 Schema 生成多条可直接提问的问题。</div></div>
@@ -49,9 +49,17 @@
       <div id="question-results"></div>
     </div>
   </dialog>
+  <dialog id="download-dialog">
+    <div class="modal-head"><div><h2>下载 Skill 包</h2><span class="hint">为当前 Skill 选择目标 Agent 工具；选择仅对本次下载生效。</span></div><button class="close" id="close-download" aria-label="关闭">×</button></div>
+    <div class="modal-body">
+      <div class="step"><div class="step-title" id="download-skill-name"></div><div class="hint" id="download-skill-id"></div></div>
+      <div class="field"><label for="download-harness">Agent 工具</label><select id="download-harness"><option value="workbuddy">WorkBuddy</option><option value="opencode">OpenCode</option></select><div class="hint">将生成对应目录结构和 MCP 配置；不同 Skill 可以下载到不同工具。</div></div>
+      <div class="form-actions"><span class="hint">ZIP 包含 Skill 文件和连接说明</span><button class="primary" id="confirm-download" type="button">下载 ZIP</button></div>
+    </div>
+  </dialog>
   <script>
     const $=id=>document.getElementById(id), admin={user_id:"demo-admin",team_id:"platform",permissions:["admin"]};
-    let skills=[], editingId=null, generatedMode="mock", questionSkill=null;
+    let skills=[], editingId=null, generatedMode="mock", questionSkill=null, downloadSkillMeta=null;
     const esc=v=>String(v??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
     const nextVersion=v=>{const m=(v||"1.0.0").match(/^(\d+)\.(\d+)\.(\d+)$/);return m?`${m[1]}.${m[2]}.${Number(m[3])+1}`:"1.0.0"};
     async function api(url,options={}){const r=await fetch(url,options),d=await r.json();if(!r.ok||d.ok===false)throw Error(d.msg||`HTTP ${r.status}`);return d}
@@ -62,15 +70,16 @@
       $("skill-count").textContent=`${skills.length} 个`;
       $("skill-rows").innerHTML=skills.length?skills.map(s=>`<tr><td><div class="skill-name">${esc(s.name)}</div><div class="mono">${esc(s.skill_id)}</div></td><td>v${esc(s.version)}</td><td>${esc(s.description)}</td><td>${(s.required_env_vars||[]).map(x=>`<span class="env-tag">${esc(x)}</span>`).join("")||'<span class="hint">无</span>'}</td><td>${esc((s.gray_teams||[]).join(", ")||"全部")}</td><td><div class="row-actions"><button class="secondary small" data-edit="${esc(s.skill_id)}">编辑</button><button class="secondary small" data-test-questions="${esc(s.skill_id)}">生成测试提问</button><button class="primary small" data-download="${esc(s.skill_id)}">下载</button></div></td></tr>`).join(""):'<tr><td colspan="6" class="empty">还没有 Skill。点击右上角“新建 Skill”，用自然语言生成第一个。</td></tr>';
        document.querySelectorAll("[data-edit]").forEach(b=>b.onclick=()=>editSkill(skills.find(s=>s.skill_id===b.dataset.edit)));
-       document.querySelectorAll("[data-download]").forEach(b=>b.onclick=()=>downloadSkill(skills.find(s=>s.skill_id===b.dataset.download)));
+       document.querySelectorAll("[data-download]").forEach(b=>b.onclick=()=>chooseDownloadSkill(skills.find(s=>s.skill_id===b.dataset.download)));
        document.querySelectorAll("[data-test-questions]").forEach(b=>b.onclick=()=>openQuestionGenerator(skills.find(s=>s.skill_id===b.dataset.testQuestions)));
     }
     function openNew(){editingId=null;$("modal-title").textContent="新建托管 Skill";$("requirement").value="";$("skill-form").reset();$("skill-form").style.display="none";$("generate-step").style.display="block";$("generation-mode").textContent="";$("notice").className="notice";$("editor").showModal()}
     function fillForm(s){$("skill-id").value=s.skill_id;$("skill-name").value=s.name;$("skill-description").value=s.description;$("skill-prompt").value=s.system_prompt_snippet;$("skill-outline").value=JSON.stringify(s.outline||[],null,2);$("skill-schema").value=JSON.stringify(s.output_schema||{},null,2);$("skill-env").value=(s.required_env_vars||[]).join(", ");$("skill-teams").value=(s.gray_teams||[]).join(", ");$("skill-secret").value=s.secret_level||"internal"}
     function editSkill(s){editingId=s.skill_id;generatedMode="manual";$("modal-title").textContent=`编辑 Skill · v${s.version}`;$("requirement").value=s.description;fillForm(s);$("publish-version").textContent=`发布新版本 v${nextVersion(s.version)}`;$("generation-mode").textContent="编辑已发布配置";$("generate-step").style.display="none";$("skill-form").style.display="block";$("notice").className="notice";$("editor").showModal()}
     function openQuestionGenerator(s){questionSkill=s;$("question-title").textContent=`生成测试提问 · ${s.name}`;$("question-guidance").value="";$("question-results").innerHTML="";$("question-mode").textContent="";$("question-notice").className="notice";$("question-dialog").showModal()}
+    function chooseDownloadSkill(s){downloadSkillMeta=s;$("download-skill-name").textContent=s.name;$("download-skill-id").textContent=s.skill_id;$("download-harness").value="workbuddy";$("download-dialog").showModal()}
     function renderQuestions(questions){$("question-results").innerHTML=questions.map((q,i)=>`<div class="step"><div class="step-title">模拟提问 ${i+1}</div><div style="white-space:pre-wrap;font-size:12px;margin:7px 0 10px">${esc(q)}</div><button class="secondary small" data-copy-question="${i}">复制问题</button></div>`).join("")+`<button class="secondary small" id="copy-all-questions">复制全部问题</button>`;document.querySelectorAll("[data-copy-question]").forEach(b=>b.onclick=()=>copyQuestions([questions[Number(b.dataset.copyQuestion)]]));$("copy-all-questions").onclick=()=>copyQuestions(questions)}
-    async function copyQuestions(questions){try{await navigator.clipboard.writeText(questions.join("\n\n"));questionNotify("已复制到剪贴板，可粘贴到 WorkBuddy 对话中测试。")}catch(_){questionNotify("无法访问剪贴板，请选择并手动复制问题。",true)}}
+    async function copyQuestions(questions){try{await navigator.clipboard.writeText(questions.join("\n\n"));questionNotify("已复制到剪贴板，可粘贴到对应 Agent 对话中测试。")}catch(_){questionNotify("无法访问剪贴板，请选择并手动复制问题。",true)}}
     $("new-skill").onclick=openNew;$("close-modal").onclick=()=>$("editor").close();$("back-generate").onclick=()=>{$("skill-form").style.display="none";$("generate-step").style.display="block"};
     $("close-question").onclick=()=>$("question-dialog").close();
     $("generate-questions").onclick=async()=>{if(!questionSkill)return;const b=$("generate-questions");b.disabled=true;b.textContent="AI 生成中…";$("question-notice").className="notice";$("question-results").innerHTML="";try{const d=await api("/skill/test-questions",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({operator:admin,skill_id:questionSkill.skill_id,guidance:$("question-guidance").value.trim()})});renderQuestions(d.data.questions);$("question-mode").textContent=`生成来源：${d.generation_mode==="remote"?"远程模型":"本地 Mock"}`}catch(e){questionNotify(e.message,true)}finally{b.disabled=false;b.textContent="✦ 生成模拟提问"}};
@@ -79,7 +88,9 @@
     $("skill-form").onsubmit=async e=>{e.preventDefault();let outline,schema;try{outline=JSON.parse($("skill-outline").value||"[]");schema=JSON.parse($("skill-schema").value||"{}");if(!Array.isArray(outline)||!schema||Array.isArray(schema)||typeof schema!=="object")throw Error()}catch(_){return notify("大纲须是 JSON 数组，Schema 须是 JSON 对象",true)}
       const old=skills.find(s=>s.skill_id===$("skill-id").value.trim());const version=old?nextVersion(old.version):"1.0.0";const skill={skill_id:$("skill-id").value.trim(),name:$("skill-name").value.trim(),description:$("skill-description").value.trim(),version,secret_level:$("skill-secret").value,system_prompt_snippet:$("skill-prompt").value.trim(),outline,output_schema:schema,required_env_vars:$("skill-env").value.split(",").map(x=>x.trim()).filter(Boolean),gray_teams:$("skill-teams").value.split(",").map(x=>x.trim()).filter(Boolean)};
       try{await api("/skill/publish",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({operator:admin,skill})});$("editor").close();await loadSkills()}catch(err){notify(err.message,true)}};
-    async function downloadSkill(s){const team=s.gray_teams?.[0]||"custos-team",harness=$("harness").value;try{const r=await fetch(`/skill/${encodeURIComponent(s.skill_id)}/download?harness=${encodeURIComponent(harness)}&user_id=demo-user&team_id=${encodeURIComponent(team)}`);if(!r.ok){const d=await r.json();throw Error(d.msg||"下载失败")}const a=document.createElement("a");a.href=URL.createObjectURL(await r.blob());a.download=`${s.skill_id}-${harness}.zip`;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000)}catch(e){alert(e.message)}}
+    $("close-download").onclick=()=>$("download-dialog").close();
+    $("confirm-download").onclick=()=>downloadSkill();
+    async function downloadSkill(){const s=downloadSkillMeta;if(!s)return;const button=$("confirm-download"),harness=$("download-harness").value,team=s.gray_teams?.[0]||"custos-team";button.disabled=true;button.textContent="准备下载…";try{const r=await fetch(`/skill/${encodeURIComponent(s.skill_id)}/download?harness=${encodeURIComponent(harness)}&user_id=demo-user&team_id=${encodeURIComponent(team)}`);if(!r.ok){const d=await r.json();throw Error(d.msg||"下载失败")}const a=document.createElement("a");a.href=URL.createObjectURL(await r.blob());a.download=`${s.skill_id}-${harness}.zip`;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000);$("download-dialog").close()}catch(e){alert(e.message)}finally{button.disabled=false;button.textContent="下载 ZIP"}}
     async function loadModel(){try{const d=await api("/model/config");$("model-status").textContent=d.data.provider==="remote"?"远程模型":"本地 Mock";$("model-detail").textContent=d.data.model?`· ${d.data.model} · API Key ${d.data.api_key_configured?"已配置":"未配置"}`:"· 配置 MODEL_BASE_URL / MODEL_NAME 后启用远程模型"}catch(_){}}
     loadSkills();loadModel();
   </script>

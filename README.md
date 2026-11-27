@@ -4,21 +4,21 @@ Custos 是单进程、零第三方依赖的 Python 原型，用于验证 Skill �
 
 ## 管理页面
 
-- **Skill 管理**（`/`）：创建并发布两个初始化示例，也可自然语言生成其他 Skill 草稿，人工修改后发布；可根据 Skill 定义和用户引导生成模拟测试提问，并下载 WorkBuddy Skill 包。
+- **Skill 管理**（`/`）：创建并发布两个初始化示例，也可自然语言生成其他 Skill 草稿，人工修改后发布；可根据 Skill 定义和用户引导生成模拟测试提问；下载时可为每个 Skill 单独选择 WorkBuddy 或 OpenCode。
 - **环境变量管理**（`/secrets-page`）：查看和配置变量名、明文值及团队范围。`GET /secrets` 同样返回明文值（POC 专用）；审计记录不包含变量值。Skill 仅声明所需变量名；运行时检查团队权限后，只向本次子进程注入声明过的变量。
-- **运行时日志**（`/runtime-logs-page`）：查询 WorkBuddy 通过 MCP 调用 Skill 工具的历史记录，只展示调用摘要，不保存代码或密钥值。
+- **运行时日志**（`/runtime-logs-page`）：查询各 Agent 工具通过 MCP 调用 Skill 工具的历史记录，只展示调用摘要，不保存代码或密钥值。
 
 初始化示例：
 
 1. **周报助手**：服务端运行时 Prompt 要求输出标题“Custos 团队周报”。标题不在客户端下载的 `SKILL.md` 中，展示远程 Prompt 变更无需重新下载。
 2. **Custos 团队通讯录**：服务启动时在临时目录创建假联系人 CSV，`CUSTOS_CONTACTS_DIR` 保存该目录的绝对路径。Skill 声明该变量，并通过 `run_code` 列出目录文件和读取联系人。
 
-下载 ZIP 包含 WorkBuddy Skill 目录 `skills/<skill-id>/SKILL.md`、用于连接 Custos MCP 服务的 `mcp.json`，及 ZIP 根目录可见的 `SKILL.md` 副本。WorkBuddy 运行时通过 MCP 获取服务端最新 Skill 配置；Harness 只使用通用 `run_code` 接口，没有固定业务工具注册。
+下载 ZIP 按所选 Agent 工具生成对应目录结构和 MCP 配置。WorkBuddy 包含 `skills/<skill-id>/SKILL.md` 与 `mcp.json`；OpenCode 包含 `.opencode/skills/<skill-id>/SKILL.md` 与 `opencode.jsonc`。两者均附有根目录可见的 `SKILL.md` 副本。运行时通过 MCP 获取服务端最新 Skill 配置；Harness 只使用通用 `run_code` 接口，没有固定业务工具注册。
 
 ## WorkBuddy 安装与连接
 
 1. **启动 Custos**：运行 `python3 app.py`，保持服务运行。默认地址为 `http://127.0.0.1:8000`。
-2. **下载 Skill 包**：打开 Custos 的 Skill 管理页，在目标 Skill 行点击“下载”。保存生成的 ZIP 文件。
+2. **下载 Skill 包**：打开 Custos 的 Skill 管理页，在目标 Skill 行点击“下载”，在弹窗中选择 `WorkBuddy`，再保存生成的 ZIP 文件。不同 Skill 可以分别选择不同 Agent 工具。
 3. **导入 Skill**：在 WorkBuddy 打开“技能”页面，点击“添加技能”→“上传技能”，选择下载的 ZIP 并完成导入。导入后即可在对话中使用该 Skill。
 4. **配置 Custos MCP 连接器**：在 WorkBuddy 打开“连接器”→“自定义连接器”，新增 MCP 连接器。将以下配置粘贴到 MCP 配置编辑器（或保存为 `mcp.json` 后导入），并按需修改服务地址和请求头：
 
@@ -76,7 +76,7 @@ python3 app.py
 | POST | `/skill/test-questions` | 根据已发布 Skill 和用户引导生成模拟提问 |
 | POST | `/skill/publish` | 发布 Skill 新版本 |
 | GET | `/skill/{id}/config` | 获取最新服务端配置及所需环境变量名 |
-| GET | `/skill/{id}/download?harness=workbuddy` | 下载 WorkBuddy Skill 包 |
+| GET | `/skill/{id}/download?harness=workbuddy` 或 `harness=opencode` | 下载所选 Agent 工具的 Skill 包 |
 | GET/POST | `/runtime`、`/runtime/configure` | 查询和设置运行时资源策略 |
 | GET | `/secrets` | 列出环境变量名、明文值和授权团队（POC） |
 | POST | `/secrets/configure`、`/secrets/remove` | 管理服务端环境变量 |

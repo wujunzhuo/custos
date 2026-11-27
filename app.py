@@ -668,6 +668,30 @@ def workbuddy_bundle(meta: dict[str, Any], service_url: str, user: UserContext,
     return bundle.getvalue()
 
 
+def open_code_bundle(meta: dict[str, Any], service_url: str, user: UserContext) -> bytes:
+    bundle = BytesIO()
+    config = {
+        "$schema": "https://opencode.ai/config.json",
+        "skills": ["./.opencode/skills"],
+        "mcp": {"servers": {"custos": {
+            "type": "remote", "url": f"{service_url.rstrip('/')}/mcp", "oauth": False,
+            "headers": {"X-User-ID": user.user_id, "X-Team-ID": user.team_id},
+        }}},
+    }
+    with zipfile.ZipFile(bundle, "w", zipfile.ZIP_DEFLATED) as archive:
+        skill_markdown = make_skill_markdown(meta)
+        archive.writestr("opencode.jsonc", json.dumps(config, ensure_ascii=False, indent=2))
+        archive.writestr(f".opencode/skills/{meta['skill_id']}/SKILL.md", skill_markdown)
+        archive.writestr("SKILL.md", skill_markdown)
+        archive.writestr("CUSTOS-SETUP.txt", (
+            "Extract this archive into an OpenCode project directory.\n"
+            "The included OpenCode config connects the Custos MCP server for runtime configuration and tool execution.\n"
+            "The active skill is under .opencode/skills/.\n"
+            "This local mock platform does not authenticate identities; its MCP headers only simulate user context.\n"
+        ))
+    return bundle.getvalue()
+
+
 def mcp_tool_catalog() -> list[dict[str, Any]]:
     return [
         {"name": "get_skill_config",
@@ -828,8 +852,8 @@ class RequestHandler(BaseHTTPRequestHandler):
         if download_match:
             skill_id = unquote(download_match.group(1))
             harness = query.get("harness", ["workbuddy"])[0]
-            if harness != "workbuddy":
-                return self._send({"ok": False, "msg": "当前仅支持 WorkBuddy harness"}, 400)
+            if harness not in {"workbuddy", "opencode"}:
+                return self._send({"ok": False, "msg": "不支持该 Harness，可选 WorkBuddy 或 OpenCode"}, 400)
             versions = STORE.skills.get(skill_id, [])
             team_default = versions[-1].gray_teams[0] if versions and versions[-1].gray_teams else "backend-dev"
             try:
@@ -842,10 +866,12 @@ class RequestHandler(BaseHTTPRequestHandler):
                     return self._send(result, 403 if "禁止" in result["msg"] or "不允许" in result["msg"] else 404)
                 host = self.headers.get("X-Forwarded-Host", self.headers.get("Host", "127.0.0.1:8000"))
                 scheme = self.headers.get("X-Forwarded-Proto", "http")
-                archive = workbuddy_bundle(result["data"], f"{scheme}://{host}", user, harness)
+                service_url = f"{scheme}://{host}"
+                archive = (workbuddy_bundle(result["data"], service_url, user) if harness == "workbuddy"
+                           else open_code_bundle(result["data"], service_url, user))
                 self.send_response(200)
                 self.send_header("Content-Type", "application/zip")
-                self.send_header("Content-Disposition", f'attachment; filename="{skill_id}.zip"')
+                self.send_header("Content-Disposition", f'attachment; filename="{skill_id}-{harness}.zip"')
                 self.send_header("Content-Length", str(len(archive)))
                 self.end_headers()
                 return self.wfile.write(archive)

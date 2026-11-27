@@ -6,7 +6,7 @@ from pathlib import Path
 
 from app import (GENERATOR, RUNTIME_CONFIG, SANDBOXES, SECRETS, SKILLS, STORE,
                  RuntimeConfig, SecretEnvVar, SkillMeta, UserContext,
-                 build_app, mcp_call, workbuddy_bundle)
+                 build_app, mcp_call, open_code_bundle, workbuddy_bundle)
 
 
 class CustosTests(unittest.TestCase):
@@ -140,6 +140,15 @@ class CustosTests(unittest.TestCase):
         self.assertEqual(config["mcpServers"]["custos"]["url"], "http://localhost:8000/mcp")
         self.assertEqual(config["mcpServers"]["custos"]["type"], "streamableHttp")
         self.assertNotIn("X-Model-Bypass", json.dumps(config))
+
+    def test_opencode_bundle_contains_opencode_skill_and_mcp_config(self):
+        weekly = SKILLS.effective("weekly-report", UserContext("alice", "custos-team"))["data"]
+        bundle = open_code_bundle(weekly, "http://localhost:8000", UserContext("alice", "custos-team"))
+        with zipfile.ZipFile(BytesIO(bundle)) as archive:
+            skill = archive.read(".opencode/skills/weekly-report/SKILL.md").decode()
+            config = json.loads(archive.read("opencode.jsonc"))
+        self.assertNotIn("Custos 团队周报", skill)
+        self.assertEqual(config["mcp"]["servers"]["custos"]["url"], "http://localhost:8000/mcp")
 
     def test_mock_skill_generation_handles_contacts(self):
         generated = GENERATOR.mock_generate("创建查看 Custos 团队联系人列表和读取邮箱的 Skill")
