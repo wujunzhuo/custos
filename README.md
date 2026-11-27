@@ -73,7 +73,7 @@ python3 app.py
 | GET | `/skills` | 已发布 Skill 列表 |
 | POST | `/skill/generate` | 自然语言生成 Skill 草稿 |
 | POST | `/skill/test-questions` | 根据已发布 Skill 和用户引导生成模拟提问 |
-| POST | `/skill/publish` | 发布 Skill 新版本 |
+| POST | `/skill/publish` | 新建或覆盖当前 Skill 配置 |
 | GET | `/skill/{id}/config` | 获取最新服务端配置及所需环境变量名 |
 | GET | `/skill/{id}/download?harness=workbuddy` 或 `harness=opencode` | 下载所选 Agent 工具的 Skill 包 |
 | GET | `/secrets` | 列出环境变量名和明文值（POC） |

@@ -65,12 +65,10 @@ class SkillMeta:
     skill_id: str
     name: str
     description: str
-    version: str
     system_prompt_snippet: str
     output_schema: dict[str, Any]
     outline: list[dict[str, Any]]
     required_env_vars: list[str] = field(default_factory=list)
-    update_at: float = field(default_factory=now)
 
 
 @dataclass
@@ -83,8 +81,7 @@ class Store:
     """All state is deliberately process-local and is reset on restart."""
 
     def __init__(self) -> None:
-        self.skills: dict[str, list[SkillMeta]] = {}
-        self.rollback_targets: dict[str, str] = {}
+        self.skills: dict[str, SkillMeta] = {}
         self.secrets: dict[str, SecretEnvVar] = {}
         self.audit: list[dict[str, Any]] = []
 
@@ -122,46 +119,23 @@ class SkillService:
             return {"ok": False, "msg": "required_env_vars必须是合法环境变量名数组"}
         if len(meta.required_env_vars) > 32 or len(set(meta.required_env_vars)) != len(meta.required_env_vars):
             return {"ok": False, "msg": "required_env_vars最多32个且不能重复"}
-        versions = self.store.skills.setdefault(meta.skill_id, [])
-        if any(item.version == meta.version for item in versions):
-            return {"ok": False, "msg": "该skill版本已存在"}
-        meta.update_at = now()
-        versions.append(meta)
-        self.store.rollback_targets.pop(meta.skill_id, None)
+        self.store.skills[meta.skill_id] = meta
         self.store.log(operator.user_id, "skill_publish", skill_id=meta.skill_id,
-                       result_preview={"version": meta.version})
+                       result_preview={"name": meta.name})
         return {"ok": True, "data": asdict(meta)}
 
     def effective(self, skill_id: str, user: UserContext, *, audit: bool = True) -> dict[str, Any]:
-        versions = self.store.skills.get(skill_id, [])
-        if not versions:
+        meta = self.store.skills.get(skill_id)
+        if meta is None:
             return {"ok": False, "msg": "skill不存在"}
-        target = self.store.rollback_targets.get(skill_id)
-        candidates = [v for v in versions if not target or v.version == target]
-        if not candidates:
-            return {"ok": False, "msg": "当前没有可用的skill版本"}
-        selected = max(candidates, key=lambda item: item.update_at)
         if audit:
             self.store.log(user.user_id, "skill_fetch", skill_id=skill_id,
                            input_snapshot={"skill_id": skill_id},
-                           result_preview={"version": selected.version})
-        return {"ok": True, "data": asdict(selected)}
+                           result_preview={"name": meta.name})
+        return {"ok": True, "data": asdict(meta)}
 
-    def rollback(self, skill_id: str, target_version: str, operator: UserContext) -> dict[str, Any]:
-        if "admin" not in operator.permissions:
-            return {"ok": False, "msg": "无权限"}
-        versions = self.store.skills.get(skill_id, [])
-        target = next((v for v in versions if v.version == target_version), None)
-        if target is None:
-            return {"ok": False, "msg": "目标版本不存在"}
-        self.store.rollback_targets[skill_id] = target_version
-        self.store.log(operator.user_id, "skill_rollback", skill_id=skill_id,
-                       result_preview={"version": target_version})
-        return {"ok": True, "data": {"skill_id": skill_id, "effective_version": target_version}}
-
-    def latest_versions(self) -> list[SkillMeta]:
-        return [max(versions, key=lambda item: item.update_at)
-                for versions in self.store.skills.values() if versions]
+    def list_all(self) -> list[SkillMeta]:
+        return list(self.store.skills.values())
 
 
 class ToolExecutionService:
@@ -506,7 +480,7 @@ def build_app() -> tuple[Store, SkillService, ToolExecutionService, SecretServic
     )
     secrets.configure(SecretEnvVar(name="CUSTOS_CONTACTS_DIR", value=contacts_dir), admin)
     skills.publish(SkillMeta(
-        skill_id="weekly-report", name="Custos 周报助手", description="根据用户提供的信息整理周报。", version="1.0.0",
+        skill_id="weekly-report", name="Custos 周报助手", description="根据用户提供的信息整理周报。",
         system_prompt_snippet="你是 Custos 周报助手。请基于用户提供的信息整理周报，不要编造事实；缺失内容明确标注待补充。最终文档第一行必须精确使用标题：Custos 周报。该标题是服务端托管模板的一部分。",
         output_schema={"type": "object", "required": ["本周完成", "风险与问题", "下周计划"]},
         outline=[{"title": "本周完成", "guidance": "概括本周完成的工作与阶段性成果。"},
@@ -514,7 +488,7 @@ def build_app() -> tuple[Store, SkillService, ToolExecutionService, SecretServic
                  {"title": "下周计划", "guidance": "按优先级列出下周计划和预期交付。"}],
         ), admin)
     skills.publish(SkillMeta(
-        skill_id="custos-contacts", name="Custos 通讯录", description="列出并读取 Custos 企业联系人目录。", version="1.0.0",
+        skill_id="custos-contacts", name="Custos 通讯录", description="列出并读取 Custos 企业联系人目录。",
         system_prompt_snippet="你可以使用一次性 Python 子进程读取企业通讯录。运行时环境变量 CUSTOS_CONTACTS_DIR 是允许访问的绝对目录。需要先用 pathlib.Path(os.environ['CUSTOS_CONTACTS_DIR']).iterdir() 列出目录文件，再按需读取其中的 CSV 文件并查找联系人姓名、部门、职位或邮箱。不得访问该目录之外的文件；不得虚构或泄露与用户请求无关的联系人信息。",
         output_schema={"type": "object", "required": ["files", "contacts"]},
         outline=[{"title": "可用文件"}, {"title": "匹配联系人"}, {"title": "联系信息"}],
@@ -550,7 +524,6 @@ This Custos skill has server-managed runtime instructions that may change withou
 ## Current platform configuration
 
 - Skill ID: `{meta['skill_id']}`
-- Downloaded bundle version: `{meta['version']}`
 - Bundle-time required environment variable names: `{', '.join(meta.get('required_env_vars', [])) or 'none'}` (for reference only; fetch current config at runtime)
 - Current detailed prompt/configuration: fetched at runtime from the Custos service.
 """
@@ -640,7 +613,7 @@ def mcp_call(name: str, arguments: dict[str, Any], user: UserContext) -> dict[st
             meta = result["data"]
             data = {
                 "skill_id": meta["skill_id"], "name": meta["name"],
-                "version": meta["version"], "system_prompt_snippet": meta["system_prompt_snippet"],
+                "system_prompt_snippet": meta["system_prompt_snippet"],
                 "outline": meta["outline"], "output_schema": meta["output_schema"],
                 "required_env_vars": meta.get("required_env_vars", []),
             }
@@ -668,7 +641,7 @@ def mcp_call(name: str, arguments: dict[str, Any], user: UserContext) -> dict[st
                           "code_sha256": hashlib.sha256(code.encode()).hexdigest() if isinstance(code, str) else None,
                           "code_bytes": len(code.encode()) if isinstance(code, str) else None}
     else:
-        preview = {"version": structured.get("version")} if structured else {}
+        preview = {"name": structured.get("name")} if structured else {}
         input_snapshot = {"skill_id": skill_id} if skill_id else {}
     STORE.log(user.user_id, "tool_call", skill_id=skill_id or None,
               execution_id=structured.get("execution_id"), tool_name=name,
@@ -735,7 +708,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         if path == "/model/config":
             return self._send({"ok": True, "data": GENERATOR.model_config()})
         if path == "/skills":
-            return self._send({"ok": True, "data": [asdict(item) for item in SKILLS.latest_versions()]})
+            return self._send({"ok": True, "data": [asdict(item) for item in SKILLS.list_all()]})
         if path == "/secrets":
             return self._send({"ok": True, "data": SECRETS.list_public()})
         if path == "/runtime-logs":
@@ -761,7 +734,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                     return self._send(result, 403 if "禁止" in result["msg"] or "不允许" in result["msg"] else 404)
                 meta = result["data"]
                 return self._send({"ok": True, "data": {
-                    "skill_id": meta["skill_id"], "name": meta["name"], "version": meta["version"],
+                    "skill_id": meta["skill_id"], "name": meta["name"],
                     "system_prompt_snippet": meta["system_prompt_snippet"],
                     "output_schema": meta["output_schema"], "outline": meta["outline"],
                     "required_env_vars": meta.get("required_env_vars", []),
@@ -846,10 +819,10 @@ class RequestHandler(BaseHTTPRequestHandler):
                 guidance = str(body.get("guidance", "")).strip()
                 if not skill_id or len(guidance) > 2000:
                     return self._send({"ok": False, "msg": "Skill ID 不能为空，引导不能超过2000字"}, 400)
-                versions = STORE.skills.get(skill_id, [])
-                if not versions:
+                skill_meta = STORE.skills.get(skill_id)
+                if skill_meta is None:
                     return self._send({"ok": False, "msg": "skill不存在"}, 404)
-                skill = asdict(max(versions, key=lambda item: item.update_at))
+                skill = asdict(skill_meta)
                 try:
                     questions, generation_mode = GENERATOR.generate_test_questions(skill, guidance)
                 except RuntimeError as exc:
@@ -863,9 +836,6 @@ class RequestHandler(BaseHTTPRequestHandler):
                 operator = self._context(body.get("operator"))
                 meta = SkillMeta(**body["skill"])
                 return self._send(SKILLS.publish(meta, operator))
-            if path == "/skill/rollback":
-                operator = self._context(body.get("operator"))
-                return self._send(SKILLS.rollback(str(body["skill_id"]), str(body["target_version"]), operator))
             if path == "/secrets/configure":
                 operator = self._context(body.get("operator"))
                 return self._send(SECRETS.configure(SecretEnvVar(**body["secret"]), operator))

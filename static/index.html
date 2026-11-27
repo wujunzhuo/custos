@@ -26,8 +26,8 @@
   <main>
     <div class="titlebar"><div><div class="eyebrow">MANAGED SKILLS</div><h1>Skill 管理</h1><p>创建并发布托管 Skill，下载时可为每个 Skill 单独选择 Agent 工具。</p></div><div class="actions"><button class="primary" id="new-skill">＋ 新建 Skill</button></div></div>
     <div class="model-status">Skill 生成模型：<span class="pill" id="model-status">读取配置…</span> <span id="model-detail"></span></div>
-    <section class="card"><div class="toolbar"><div><strong>已发布 Skills</strong><br><span>服务端管理运行时模板；修改后发布新版本</span></div><span id="skill-count"></span></div>
-      <div class="table-wrap"><table><thead><tr><th>名称 / ID</th><th>版本</th><th>描述</th><th>运行时环境变量</th><th>操作</th></tr></thead><tbody id="skill-rows"><tr><td colspan="5" class="empty">加载中…</td></tr></tbody></table></div>
+    <section class="card"><div class="toolbar"><div><strong>已发布 Skills</strong><br><span>服务端保存每个 Skill 的当前配置；编辑后直接更新</span></div><span id="skill-count"></span></div>
+      <div class="table-wrap"><table><thead><tr><th>名称 / ID</th><th>描述</th><th>运行时环境变量</th><th>操作</th></tr></thead><tbody id="skill-rows"><tr><td colspan="4" class="empty">加载中…</td></tr></tbody></table></div>
     </section>
   </main>
 
@@ -44,7 +44,7 @@
         <div class="field"><label for="skill-outline">输出大纲 JSON</label><textarea id="skill-outline"></textarea></div>
         <div class="field"><label for="skill-schema">输出 Schema JSON</label><textarea id="skill-schema"></textarea></div>
         <div class="field"><label for="skill-env">需要的环境变量名（逗号分隔）</label><input id="skill-env" placeholder="CUSTOS_CONTACTS_DIR"><div class="hint">这里只声明名称；变量值在环境变量页面配置。</div></div>
-        <div class="form-actions"><span class="hint" id="publish-version"></span><div><button class="secondary" id="back-generate" type="button">返回描述</button> <button class="primary" type="submit">发布 Skill</button></div></div>
+        <div class="form-actions"><span></span><div><button class="secondary" id="back-generate" type="button">返回描述</button> <button class="primary" type="submit">保存 Skill</button></div></div>
       </form>
     </div>
   </dialog>
@@ -67,23 +67,22 @@
   </dialog>
   <script>
     const $=id=>document.getElementById(id), admin={user_id:"demo-admin",permissions:["admin"]};
-    let skills=[], editingId=null, generatedMode="mock", questionSkill=null, downloadSkillMeta=null;
+    let skills=[], generatedMode="mock", questionSkill=null, downloadSkillMeta=null;
     const esc=v=>String(v??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
-    const nextVersion=v=>{const m=(v||"1.0.0").match(/^(\d+)\.(\d+)\.(\d+)$/);return m?`${m[1]}.${m[2]}.${Number(m[3])+1}`:"1.0.0"};
     async function api(url,options={}){const r=await fetch(url,options),d=await r.json();if(!r.ok||d.ok===false)throw Error(d.msg||`HTTP ${r.status}`);return d}
     function notify(msg,error=false){const n=$("notice");n.textContent=msg;n.className=`notice show ${error?"error":"ok"}`}
     function questionNotify(msg,error=false){const n=$("question-notice");n.textContent=msg;n.className=`notice show ${error?"error":"ok"}`}
-    async function loadSkills(){try{const d=await api("/skills");skills=d.data.sort((a,b)=>a.name.localeCompare(b.name,"zh-CN"));renderSkills()}catch(e){$("skill-rows").innerHTML=`<tr><td colspan="5" class="empty">${esc(e.message)}</td></tr>`}}
+    async function loadSkills(){try{const d=await api("/skills");skills=d.data.sort((a,b)=>a.name.localeCompare(b.name,"zh-CN"));renderSkills()}catch(e){$("skill-rows").innerHTML=`<tr><td colspan="4" class="empty">${esc(e.message)}</td></tr>`}}
     function renderSkills(){
       $("skill-count").textContent=`${skills.length} 个`;
-      $("skill-rows").innerHTML=skills.length?skills.map(s=>`<tr><td><div class="skill-name">${esc(s.name)}</div><div class="mono">${esc(s.skill_id)}</div></td><td>v${esc(s.version)}</td><td>${esc(s.description)}</td><td>${(s.required_env_vars||[]).map(x=>`<span class="env-tag">${esc(x)}</span>`).join("")||'<span class="hint">无</span>'}</td><td><div class="row-actions"><button class="secondary small" data-edit="${esc(s.skill_id)}">编辑</button><button class="secondary small" data-test-questions="${esc(s.skill_id)}">生成测试提问</button><button class="primary small" data-download="${esc(s.skill_id)}">下载</button></div></td></tr>`).join(""):'<tr><td colspan="5" class="empty">还没有 Skill。点击右上角“新建 Skill”，用自然语言生成第一个。</td></tr>';
+      $("skill-rows").innerHTML=skills.length?skills.map(s=>`<tr><td><div class="skill-name">${esc(s.name)}</div><div class="mono">${esc(s.skill_id)}</div></td><td>${esc(s.description)}</td><td>${(s.required_env_vars||[]).map(x=>`<span class="env-tag">${esc(x)}</span>`).join("")||'<span class="hint">无</span>'}</td><td><div class="row-actions"><button class="secondary small" data-edit="${esc(s.skill_id)}">编辑</button><button class="secondary small" data-test-questions="${esc(s.skill_id)}">生成测试提问</button><button class="primary small" data-download="${esc(s.skill_id)}">下载</button></div></td></tr>`).join(""):'<tr><td colspan="4" class="empty">还没有 Skill。点击右上角“新建 Skill”，用自然语言生成第一个。</td></tr>';
        document.querySelectorAll("[data-edit]").forEach(b=>b.onclick=()=>editSkill(skills.find(s=>s.skill_id===b.dataset.edit)));
        document.querySelectorAll("[data-download]").forEach(b=>b.onclick=()=>chooseDownloadSkill(skills.find(s=>s.skill_id===b.dataset.download)));
        document.querySelectorAll("[data-test-questions]").forEach(b=>b.onclick=()=>openQuestionGenerator(skills.find(s=>s.skill_id===b.dataset.testQuestions)));
     }
-    function openNew(){editingId=null;$("modal-title").textContent="新建托管 Skill";$("requirement").value="";$("skill-form").reset();$("skill-form").style.display="none";$("generate-step").style.display="block";$("generation-mode").textContent="";$("notice").className="notice";$("editor").showModal()}
+    function openNew(){$("modal-title").textContent="新建托管 Skill";$("requirement").value="";$("skill-form").reset();$("skill-form").style.display="none";$("generate-step").style.display="block";$("generation-mode").textContent="";$("notice").className="notice";$("editor").showModal()}
     function fillForm(s){$("skill-id").value=s.skill_id;$("skill-name").value=s.name;$("skill-description").value=s.description;$("skill-prompt").value=s.system_prompt_snippet;$("skill-outline").value=JSON.stringify(s.outline||[],null,2);$("skill-schema").value=JSON.stringify(s.output_schema||{},null,2);$("skill-env").value=(s.required_env_vars||[]).join(", ")}
-    function editSkill(s){editingId=s.skill_id;generatedMode="manual";$("modal-title").textContent=`编辑 Skill · v${s.version}`;$("requirement").value=s.description;fillForm(s);$("publish-version").textContent=`发布新版本 v${nextVersion(s.version)}`;$("generation-mode").textContent="编辑已发布配置";$("generate-step").style.display="none";$("skill-form").style.display="block";$("notice").className="notice";$("editor").showModal()}
+    function editSkill(s){generatedMode="manual";$("modal-title").textContent=`编辑 Skill · ${s.name}`;$("requirement").value=s.description;fillForm(s);$("generation-mode").textContent="保存后立即更新当前配置";$("generate-step").style.display="none";$("skill-form").style.display="block";$("notice").className="notice";$("editor").showModal()}
     function openQuestionGenerator(s){questionSkill=s;$("question-title").textContent=`生成测试提问 · ${s.name}`;$("question-guidance").value="";$("question-results").innerHTML="";$("question-mode").textContent="";$("question-notice").className="notice";$("question-dialog").showModal()}
     function chooseDownloadSkill(s){downloadSkillMeta=s;$("download-skill-name").textContent=s.name;$("download-skill-id").textContent=s.skill_id;$("download-harness").value="workbuddy";$("download-dialog").showModal()}
     function renderQuestions(questions){$("question-results").innerHTML=questions.map((q,i)=>`<div class="step"><div class="step-title">模拟提问 ${i+1}</div><div style="white-space:pre-wrap;font-size:12px;margin:7px 0 10px">${esc(q)}</div><button class="secondary small" data-copy-question="${i}">复制问题</button></div>`).join("")+`<button class="secondary small" id="copy-all-questions">复制全部问题</button>`;document.querySelectorAll("[data-copy-question]").forEach(b=>b.onclick=()=>copyQuestions([questions[Number(b.dataset.copyQuestion)]]));$("copy-all-questions").onclick=()=>copyQuestions(questions)}
@@ -92,9 +91,9 @@
     $("close-question").onclick=()=>$("question-dialog").close();
     $("generate-questions").onclick=async()=>{if(!questionSkill)return;const b=$("generate-questions");b.disabled=true;b.textContent="AI 生成中…";$("question-notice").className="notice";$("question-results").innerHTML="";try{const d=await api("/skill/test-questions",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({operator:admin,skill_id:questionSkill.skill_id,guidance:$("question-guidance").value.trim()})});renderQuestions(d.data.questions);$("question-mode").textContent=`生成来源：${d.generation_mode==="remote"?"远程模型":"本地 Mock"}`}catch(e){questionNotify(e.message,true)}finally{b.disabled=false;b.textContent="✦ 生成模拟提问"}};
     $("generate").onclick=async()=>{const description=$("requirement").value.trim();if(!description)return notify("请先描述 Skill 需求",true);const b=$("generate");b.disabled=true;b.textContent="模型生成中…";$("notice").className="notice";
-      try{const d=await api("/skill/generate",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({operator:admin,description})});const s=d.data;generatedMode=d.generation_mode;editingId=null;fillForm({...s,version:"1.0.0"});const existing=skills.find(x=>x.skill_id===s.skill_id);if(existing){editingId=existing.skill_id;$("publish-version").textContent=`将发布新版本 v${nextVersion(existing.version)}`}else $("publish-version").textContent="将发布新 Skill v1.0.0";$("generation-mode").textContent=`生成来源：${generatedMode==="remote"?"远程模型":"本地 Mock"} · 可编辑草稿`;$("generate-step").style.display="none";$("skill-form").style.display="block";notify("草稿已生成，请审核并修改后再发布")}catch(e){notify(e.message,true)}finally{b.disabled=false;b.textContent="✦ AI 生成 Skill 草稿"}};
+      try{const d=await api("/skill/generate",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({operator:admin,description})});const s=d.data;generatedMode=d.generation_mode;fillForm(s);$("generation-mode").textContent=`生成来源：${generatedMode==="remote"?"远程模型":"本地 Mock"} · 可编辑草稿`;$("generate-step").style.display="none";$("skill-form").style.display="block";notify("草稿已生成，请审核并保存")}catch(e){notify(e.message,true)}finally{b.disabled=false;b.textContent="✦ AI 生成 Skill 草稿"}};
     $("skill-form").onsubmit=async e=>{e.preventDefault();let outline,schema;try{outline=JSON.parse($("skill-outline").value||"[]");schema=JSON.parse($("skill-schema").value||"{}");if(!Array.isArray(outline)||!schema||Array.isArray(schema)||typeof schema!=="object")throw Error()}catch(_){return notify("大纲须是 JSON 数组，Schema 须是 JSON 对象",true)}
-      const old=skills.find(s=>s.skill_id===$("skill-id").value.trim());const version=old?nextVersion(old.version):"1.0.0";const skill={skill_id:$("skill-id").value.trim(),name:$("skill-name").value.trim(),description:$("skill-description").value.trim(),version,system_prompt_snippet:$("skill-prompt").value.trim(),outline,output_schema:schema,required_env_vars:$("skill-env").value.split(",").map(x=>x.trim()).filter(Boolean)};
+      const skill={skill_id:$("skill-id").value.trim(),name:$("skill-name").value.trim(),description:$("skill-description").value.trim(),system_prompt_snippet:$("skill-prompt").value.trim(),outline,output_schema:schema,required_env_vars:$("skill-env").value.split(",").map(x=>x.trim()).filter(Boolean)};
       try{await api("/skill/publish",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({operator:admin,skill})});$("editor").close();await loadSkills()}catch(err){notify(err.message,true)}};
     $("close-download").onclick=()=>$("download-dialog").close();
     $("confirm-download").onclick=()=>downloadSkill();

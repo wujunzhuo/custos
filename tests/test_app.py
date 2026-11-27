@@ -17,7 +17,7 @@ class CustosTests(unittest.TestCase):
 
     def test_startup_examples_are_weekly_report_and_private_contacts(self):
         fresh_store, fresh_skills, _, _ = build_app()
-        self.assertEqual({skill.skill_id for skill in fresh_skills.latest_versions()},
+        self.assertEqual({skill.skill_id for skill in fresh_skills.list_all()},
                          {"weekly-report", "custos-contacts"})
         weekly = fresh_skills.effective("weekly-report", UserContext("staff"))["data"]
         self.assertIn("Custos 周报", weekly["system_prompt_snippet"])
@@ -62,7 +62,7 @@ class CustosTests(unittest.TestCase):
         admin = UserContext("admin", permissions=["admin"])
         meta = SkillMeta(
             skill_id="missing-env-test", name="Missing env test", description="test required env",
-            version="1.0.0", system_prompt_snippet="test",
+            system_prompt_snippet="test",
             output_schema={}, outline=[], required_env_vars=["NOT_CONFIGURED"],
         )
         self.assertTrue(SKILLS.publish(meta, admin)["ok"])
@@ -72,11 +72,28 @@ class CustosTests(unittest.TestCase):
         self.assertIn("NOT_CONFIGURED", missing["msg"])
         self.assertFalse(any(row["action_type"] == "tool_execution" for row in STORE.audit))
 
+    def test_publishing_same_skill_replaces_the_current_config(self):
+        _, fresh_skills, _, _ = build_app()
+        admin = UserContext("admin", permissions=["admin"])
+        original = SkillMeta(
+            skill_id="replace-me", name="First", description="First config",
+            system_prompt_snippet="first prompt", output_schema={}, outline=[],
+        )
+        updated = SkillMeta(
+            skill_id="replace-me", name="Updated", description="Updated config",
+            system_prompt_snippet="updated prompt", output_schema={}, outline=[],
+        )
+        self.assertTrue(fresh_skills.publish(original, admin)["ok"])
+        self.assertTrue(fresh_skills.publish(updated, admin)["ok"])
+        current = fresh_skills.effective("replace-me", UserContext("viewer"))["data"]
+        self.assertEqual(current["system_prompt_snippet"], "updated prompt")
+        self.assertEqual(sum(skill.skill_id == "replace-me" for skill in fresh_skills.list_all()), 1)
+
     def test_tool_timeout_stops_child_process(self):
         admin = UserContext("admin", permissions=["admin"])
         meta = SkillMeta(
             skill_id="timeout-test-skill", name="Timeout test", description="test timeout",
-            version="1.0.0", system_prompt_snippet="test",
+            system_prompt_snippet="test",
             output_schema={}, outline=[],
         )
         self.assertTrue(SKILLS.publish(meta, admin)["ok"])
@@ -101,6 +118,7 @@ class CustosTests(unittest.TestCase):
         user = UserContext("alice")
         config = mcp_call("get_skill_config", {"skill_id": "custos-contacts"}, user)
         self.assertEqual(config["structuredContent"]["required_env_vars"], ["CUSTOS_CONTACTS_DIR"])
+        self.assertNotIn("version", config["structuredContent"])
         result = mcp_call("run_code", {
             "skill_id": "custos-contacts",
             "code": "import os; print(os.path.isabs(os.environ['CUSTOS_CONTACTS_DIR']))",
@@ -112,6 +130,7 @@ class CustosTests(unittest.TestCase):
         weekly = SKILLS.effective("weekly-report", UserContext("alice"))["data"]
         self.assertIn("Custos 周报", weekly["system_prompt_snippet"])
         self.assertNotIn("gray_teams", weekly)
+        self.assertNotIn("version", weekly)
         bundle = workbuddy_bundle(weekly, "http://localhost:8000", UserContext("alice"))
         with zipfile.ZipFile(BytesIO(bundle)) as archive:
             skill = archive.read("skills/weekly-report/SKILL.md").decode()
@@ -120,6 +139,7 @@ class CustosTests(unittest.TestCase):
         self.assertNotIn("该标题是服务端托管模板的一部分", skill)
         self.assertNotIn("该标题是服务端托管模板的一部分", visible_skill)
         self.assertEqual(skill, visible_skill)
+        self.assertNotIn("Downloaded bundle version", skill)
         self.assertEqual(config["mcpServers"]["custos"]["url"], "http://localhost:8000/mcp")
         self.assertEqual(config["mcpServers"]["custos"]["type"], "streamableHttp")
         self.assertNotIn("X-Team-ID", json.dumps(config))
