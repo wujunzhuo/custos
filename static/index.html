@@ -61,8 +61,8 @@
     <div class="modal-head"><div><h2>下载 Skill 包</h2><span class="hint">为当前 Skill 选择目标 Agent 工具；选择仅对本次下载生效。</span></div><button class="close" id="close-download" aria-label="关闭">×</button></div>
     <div class="modal-body">
       <div class="step"><div class="step-title" id="download-skill-name"></div><div class="hint" id="download-skill-id"></div></div>
-      <div class="field"><label for="download-harness">Agent 工具</label><select id="download-harness"><option value="workbuddy">WorkBuddy</option><option value="opencode">OpenCode</option></select><div class="hint">将生成对应目录结构和 MCP 配置；不同 Skill 可以下载到不同工具。</div></div>
-      <div class="form-actions"><span class="hint">ZIP 包含 Skill 文件和连接说明</span><button class="primary" id="confirm-download" type="button">下载 ZIP</button></div>
+      <div class="field"><label for="download-harness">Agent 工具</label><select id="download-harness"><option value="workbuddy">WorkBuddy</option><option value="opencode">OpenCode</option></select><div class="hint">将生成对应 Skill 包。WorkBuddy ZIP 仅附 MCP 配置片段，MCP 服务由每位用户在客户端统一配置。</div></div>
+      <div class="form-actions"><span class="hint">ZIP 不包含个人 Key</span><button class="primary" id="confirm-download" type="button">下载 ZIP</button></div>
     </div>
   </dialog>
   <script>

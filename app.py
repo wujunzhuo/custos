@@ -12,6 +12,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 import zipfile
@@ -29,13 +30,15 @@ def now() -> float:
     return time.time()
 
 
-def trace_id(prefix: str = "audit") -> str:
+def trace_id(prefix: str = "runtime") -> str:
     return f"{prefix}-{uuid.uuid4().hex[:12]}"
 
 
 MODEL_BASE_URL = os.environ.get("MODEL_BASE_URL", os.environ.get("LLM_BASE_URL", "")).strip()
 MODEL_API_KEY = os.environ.get("MODEL_API_KEY", os.environ.get("LLM_API_KEY", ""))
 MODEL_NAME = os.environ.get("MODEL_NAME", os.environ.get("LLM_MODEL", "")).strip()
+MCP_KEY_PATTERN = re.compile(r"csk_[0-9a-f]{32}")
+MCP_KEY_FORMAT_HINT = "Bearer Key 格式应为 csk_ 加 32 位小写十六进制字符"
 
 
 @dataclass
@@ -82,21 +85,47 @@ class Store:
     def __init__(self) -> None:
         self.skills: dict[str, SkillMeta] = {}
         self.secrets: dict[str, SecretEnvVar] = {}
-        self.audit: list[dict[str, Any]] = []
 
-    def log(self, user_id: str, action_type: str, *, skill_id: str | None = None,
-            execution_id: str | None = None,
-            tool_name: str | None = None, input_snapshot: Any = None,
-            result_preview: Any = None, tags: list[str] | None = None) -> str:
-        ref = trace_id()
-        self.audit.append({
-            "trace_id": ref, "user_id": user_id, "skill_id": skill_id,
-            "execution_id": execution_id, "action_type": action_type,
-            "tool_name": tool_name,
+
+class RuntimeObservability:
+    """Process-local MCP and tool-execution events for operational inspection."""
+
+    def __init__(self) -> None:
+        self.events: list[dict[str, Any]] = []
+        self._lock = threading.Lock()
+
+    def record(self, event_type: str, *, user_id: str | None = None,
+               skill_id: str | None = None, execution_id: str | None = None,
+               tool_name: str | None = None, duration_ms: int | None = None,
+               input_snapshot: Any = None, result_preview: Any = None,
+               tags: list[str] | None = None) -> str:
+        event_id = trace_id()
+        event = {
+            "trace_id": event_id, "timestamp": now(), "event_type": event_type,
+            "user_id": user_id, "skill_id": skill_id, "execution_id": execution_id,
+            "tool_name": tool_name, "duration_ms": duration_ms,
             "input_snapshot": input_snapshot, "result_preview": result_preview,
-            "timestamp": now(), "tags": tags or [],
-        })
-        return ref
+            "tags": tags or [],
+        }
+        with self._lock:
+            self.events.append(event)
+        return event_id
+
+    def query(self, *, event_type: str | None = None, tool_name: str | None = None,
+              skill_id: str | None = None, limit: int = 200) -> list[dict[str, Any]]:
+        with self._lock:
+            events = list(self.events)
+        if event_type:
+            events = [event for event in events if event["event_type"] == event_type]
+        if tool_name:
+            events = [event for event in events if event.get("tool_name") == tool_name]
+        if skill_id:
+            events = [event for event in events if event.get("skill_id") == skill_id]
+        return list(reversed(events[-limit:]))
+
+    def clear(self) -> None:
+        with self._lock:
+            self.events.clear()
 
 
 class SkillService:
@@ -119,18 +148,12 @@ class SkillService:
         if len(meta.required_env_vars) > 32 or len(set(meta.required_env_vars)) != len(meta.required_env_vars):
             return {"ok": False, "msg": "required_env_vars最多32个且不能重复"}
         self.store.skills[meta.skill_id] = meta
-        self.store.log(operator.user_id, "skill_publish", skill_id=meta.skill_id,
-                       result_preview={"name": meta.name})
         return {"ok": True, "data": asdict(meta)}
 
-    def effective(self, skill_id: str, user: UserContext, *, audit: bool = True) -> dict[str, Any]:
+    def effective(self, skill_id: str) -> dict[str, Any]:
         meta = self.store.skills.get(skill_id)
         if meta is None:
             return {"ok": False, "msg": "skill不存在"}
-        if audit:
-            self.store.log(user.user_id, "skill_fetch", skill_id=skill_id,
-                           input_snapshot={"skill_id": skill_id},
-                           result_preview={"name": meta.name})
         return {"ok": True, "data": asdict(meta)}
 
     def list_all(self) -> list[SkillMeta]:
@@ -144,8 +167,8 @@ class ToolExecutionService:
     MAX_OUTPUT_BYTES = 256 * 1024
     TIMEOUT_SECONDS = 30
 
-    def __init__(self, store: Store, skills: SkillService):
-        self.store, self.skills = store, skills
+    def __init__(self, store: Store, skills: SkillService, observability: RuntimeObservability):
+        self.store, self.skills, self.observability = store, skills, observability
 
     @staticmethod
     def _redact(text: str, secrets: dict[str, str]) -> str:
@@ -156,7 +179,7 @@ class ToolExecutionService:
     def run(self, skill_id: str, code: str, user: UserContext) -> dict[str, Any]:
         if not isinstance(code, str) or not code.strip() or len(code.encode("utf-8")) > self.MAX_CODE_BYTES:
             return {"ok": False, "msg": "代码不能为空且不能超过64KB"}
-        effective = self.skills.effective(skill_id, user, audit=False)
+        effective = self.skills.effective(skill_id)
         if not effective["ok"]:
             return effective
         required_names = effective["data"].get("required_env_vars", [])
@@ -228,15 +251,17 @@ class ToolExecutionService:
             "duration_ms": duration_ms, "stdout": stdout, "stderr": stderr,
             "output_truncated": truncated,
         }
-        self.store.log(user.user_id, "tool_execution", skill_id=skill_id,
-                       execution_id=execution_id,
-                       input_snapshot={"code_sha256": hashlib.sha256(code.encode()).hexdigest(),
-                                        "code_bytes": len(code.encode())},
-                       result_preview={"exit_code": process.returncode, "timed_out": timed_out,
-                                        "duration_ms": duration_ms,
-                                        "stdout_bytes": len(stdout.encode()),
-                                        "stderr_bytes": len(stderr.encode())},
-                       tags=[f"injected_env_names:{','.join(sorted(runtime_secrets))}"])
+        self.observability.record(
+            "tool_execution", user_id=user.user_id, skill_id=skill_id,
+            tool_name="run_code", execution_id=execution_id, duration_ms=duration_ms,
+            input_snapshot={"code_sha256": hashlib.sha256(code.encode()).hexdigest(),
+                            "code_bytes": len(code.encode())},
+            result_preview={"exit_code": process.returncode, "timed_out": timed_out,
+                            "duration_ms": duration_ms,
+                            "stdout_bytes": len(stdout.encode()),
+                            "stderr_bytes": len(stderr.encode())},
+            tags=[f"injected_env_names:{','.join(sorted(runtime_secrets))}"],
+        )
         return {"ok": True, "data": response}
 
 
@@ -258,8 +283,6 @@ class SecretService:
         if not isinstance(secret.value, str) or not secret.value or len(secret.value) > 16_384 or "\x00" in secret.value:
             return {"ok": False, "msg": "环境变量值不能为空且长度不能超过16KB"}
         self.store.secrets[secret.name] = secret
-        self.store.log(operator.user_id, "secret_configure", result_preview={"name": secret.name},
-                       tags=["secret_value_not_audited"])
         return {"ok": True, "data": {"name": secret.name}}
 
     def remove(self, name: str, operator: UserContext) -> dict[str, Any]:
@@ -268,7 +291,6 @@ class SecretService:
         if name not in self.store.secrets:
             return {"ok": False, "msg": "环境变量不存在"}
         del self.store.secrets[name]
-        self.store.log(operator.user_id, "secret_remove", result_preview={"name": name})
         return {"ok": True, "data": {"name": name, "removed": True}}
 
 
@@ -444,10 +466,11 @@ class SkillGenerator:
 GENERATOR = SkillGenerator()
 
 
-def build_app() -> tuple[Store, SkillService, ToolExecutionService, SecretService]:
+def build_app() -> tuple[Store, SkillService, ToolExecutionService, SecretService, RuntimeObservability]:
     store = Store()
     skills = SkillService(store)
-    tool_executor = ToolExecutionService(store, skills)
+    observability = RuntimeObservability()
+    tool_executor = ToolExecutionService(store, skills, observability)
     secrets = SecretService(store)
     admin = UserContext("seed-admin", permissions=["admin"])
     with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline="", suffix=".csv",
@@ -492,12 +515,10 @@ def build_app() -> tuple[Store, SkillService, ToolExecutionService, SecretServic
         output_schema={"type": "object", "required": ["contacts"]},
         outline=[{"title": "匹配联系人"}, {"title": "联系信息"}],
         required_env_vars=["CUSTOS_CONTACTS_CSV"]), admin)
-    # Startup fixtures are not user actions; keep the audit view focused on runtime activity.
-    store.audit.clear()
-    return store, skills, tool_executor, secrets
+    return store, skills, tool_executor, secrets, observability
 
 
-STORE, SKILLS, TOOL_EXECUTOR, SECRETS = build_app()
+STORE, SKILLS, TOOL_EXECUTOR, SECRETS, OBSERVABILITY = build_app()
 
 
 def make_skill_markdown(meta: dict[str, Any]) -> str:
@@ -529,14 +550,17 @@ This Custos skill has server-managed runtime instructions that may change withou
 
 
 def user_from_headers(handler: BaseHTTPRequestHandler) -> UserContext:
-    return UserContext(
-        user_id=handler.headers.get("X-User-ID", "local-user"),
-        token=handler.headers.get("Authorization", "mock-token"),
-        permissions=["user"],
-    )
+    authorization = handler.headers.get("Authorization", "").strip()
+    parts = authorization.split(None, 1)
+    if (len(parts) != 2 or parts[0].lower() != "bearer"
+            or MCP_KEY_PATTERN.fullmatch(parts[1]) is None):
+        raise ValueError(MCP_KEY_FORMAT_HINT)
+    key = parts[1]
+    # This prototype checks shape only. It does not verify that an administrator issued the key.
+    return UserContext(user_id=key[-6:], permissions=["user"])
 
 
-def workbuddy_bundle(meta: dict[str, Any], service_url: str, user: UserContext,
+def workbuddy_bundle(meta: dict[str, Any], service_url: str,
                      harness: str = "workbuddy") -> bytes:
     if harness != "workbuddy":
         raise ValueError("当前仅支持 WorkBuddy harness")
@@ -545,32 +569,37 @@ def workbuddy_bundle(meta: dict[str, Any], service_url: str, user: UserContext,
         "mcpServers": {"custos": {
             "type": "streamableHttp", "url": f"{service_url.rstrip('/')}/mcp", "timeout": 30000,
             "headers": {
-                "X-User-ID": user.user_id,
+                "Authorization": "Bearer REPLACE_WITH_YOUR_PERSONAL_KEY",
             },
         }},
     }
+    setup_config = json.dumps(config, ensure_ascii=False, indent=2)
     with zipfile.ZipFile(bundle, "w", zipfile.ZIP_DEFLATED) as archive:
         skill_markdown = make_skill_markdown(meta)
-        archive.writestr("mcp.json", json.dumps(config, ensure_ascii=False, indent=2))
         archive.writestr(f"skills/{meta['skill_id']}/SKILL.md", skill_markdown)
         archive.writestr("SKILL.md", skill_markdown)
         archive.writestr("CUSTOS-SETUP.txt", (
-            "Import the skills/<skill-id>/ folder into WorkBuddy's Skills area (or copy it to ~/.workbuddy/skills/).\n"
-            "Configure the included mcp.json in WorkBuddy's MCP settings to connect Custos for managed Skill configuration and tool execution.\n"
-            "SKILL.md at the archive root is a visible copy; the active skill is under skills/<skill-id>/.\n"
-            "This local mock platform does not authenticate identities; its MCP headers only simulate user context.\n"
+            "这是普通 WorkBuddy Skill ZIP，不是 Connector 发布包，不需要走 Connector 上架流程。\n"
+            "1. 首次使用时，将下方 custos 条目合并到 WorkBuddy 用户级 MCP 配置中现有的 mcpServers 对象。Custos MCP 每位用户只需配置一次；只添加/更新 custos 条目，不要覆盖其他 MCP 配置。\n"
+            "2. 将 Authorization 中 REPLACE_WITH_YOUR_PERSONAL_KEY 替换为管理员单独发给你的 Key。此本地配置会明文保存 Key，请勿共享或提交到代码仓库。\n"
+            "3. 将 skills/<skill-id>/ 导入 WorkBuddy 的 Skills。之后下载其他 Custos Skill 时只需导入 Skill，不必重复配置 MCP。\n"
+            "Key 格式：csk_ 加 32 位小写十六进制字符。ZIP 不含真实 Key。\n"
+            f"\nWorkBuddy MCP 配置示例：\n{setup_config}\n"
+            "此 Mock 只校验 Key 格式，不验证 Key 是否由管理员签发；运行日志的 user_id 是 Key 末 6 位。\n"
+            "上方配置示例的服务地址按下载地址生成；若客户端无法访问，请改成 WorkBuddy 可访问的地址。\n"
+            "根目录 SKILL.md 是可见副本；实际导入路径在 skills/<skill-id>/。\n"
         ))
     return bundle.getvalue()
 
 
-def open_code_bundle(meta: dict[str, Any], service_url: str, user: UserContext) -> bytes:
+def open_code_bundle(meta: dict[str, Any], service_url: str) -> bytes:
     bundle = BytesIO()
     config = {
         "$schema": "https://opencode.ai/config.json",
         "skills": ["./.opencode/skills"],
         "mcp": {"servers": {"custos": {
             "type": "remote", "url": f"{service_url.rstrip('/')}/mcp", "oauth": False,
-            "headers": {"X-User-ID": user.user_id},
+            "headers": {"Authorization": "Bearer {env:CUSTOS_MCP_KEY}"},
         }}},
     }
     with zipfile.ZipFile(bundle, "w", zipfile.ZIP_DEFLATED) as archive:
@@ -580,9 +609,11 @@ def open_code_bundle(meta: dict[str, Any], service_url: str, user: UserContext) 
         archive.writestr("SKILL.md", skill_markdown)
         archive.writestr("CUSTOS-SETUP.txt", (
             "Extract this archive into an OpenCode project directory.\n"
-            "The included OpenCode config connects the Custos MCP server for managed Skill configuration and tool execution.\n"
+            "Set CUSTOS_MCP_KEY in the environment before starting OpenCode; the key is not included in this ZIP.\n"
+            "Key format: csk_ followed by 32 lowercase hexadecimal characters.\n"
+            "The included OpenCode config reads the key from that environment variable. A suggested local file is ~/.config/custos/credentials.env (chmod 600); load it before starting OpenCode.\n"
+            "This mock checks key format only; it does not verify key issuance. The logged user_id is the key's final six characters.\n"
             "The active skill is under .opencode/skills/.\n"
-            "This local mock platform does not authenticate identities; its MCP headers only simulate user context.\n"
         ))
     return bundle.getvalue()
 
@@ -603,9 +634,10 @@ def mcp_tool_catalog() -> list[dict[str, Any]]:
 
 
 def mcp_call(name: str, arguments: dict[str, Any], user: UserContext) -> dict[str, Any]:
+    started = time.monotonic()
     skill_id = str(arguments.get("skill_id", ""))
     if name == "get_skill_config":
-        result = SKILLS.effective(skill_id, user, audit=False)
+        result = SKILLS.effective(skill_id)
         if not result["ok"]:
             response = {"isError": True, "content": [{"type": "text", "text": result["msg"]}]}
         else:
@@ -642,10 +674,13 @@ def mcp_call(name: str, arguments: dict[str, Any], user: UserContext) -> dict[st
     else:
         preview = {"name": structured.get("name")} if structured else {}
         input_snapshot = {"skill_id": skill_id} if skill_id else {}
-    STORE.log(user.user_id, "tool_call", skill_id=skill_id or None,
-              execution_id=structured.get("execution_id"), tool_name=name,
-              input_snapshot=input_snapshot,
-              result_preview={"is_error": bool(response.get("isError")), **preview})
+    OBSERVABILITY.record(
+        "mcp_tool_call", user_id=user.user_id, skill_id=skill_id or None,
+        execution_id=structured.get("execution_id"), tool_name=name,
+        duration_ms=round((time.monotonic() - started) * 1000),
+        input_snapshot=input_snapshot,
+        result_preview={"is_error": bool(response.get("isError")), **preview},
+    )
     return response
 
 
@@ -655,11 +690,14 @@ class RequestHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args: Any) -> None:
         print(f"[{self.log_date_time_string()}] {fmt % args}")
 
-    def _send(self, body: dict[str, Any], status: int = 200) -> None:
+    def _send(self, body: dict[str, Any], status: int = 200,
+              headers: dict[str, str] | None = None) -> None:
         data = json.dumps(body, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(data)
 
@@ -711,82 +749,52 @@ class RequestHandler(BaseHTTPRequestHandler):
         if path == "/secrets":
             return self._send({"ok": True, "data": SECRETS.list_public()})
         if path == "/runtime-logs":
-            records = [row for row in STORE.audit if row["action_type"] == "tool_call"]
-            if query.get("tool_name"):
-                records = [row for row in records if row.get("tool_name") == query["tool_name"][0]]
-            if query.get("skill_id"):
-                records = [row for row in records if row.get("skill_id") == query["skill_id"][0]]
             try:
                 limit = max(1, min(1000, int(query.get("limit", ["200"])[0])))
             except ValueError:
                 return self._send({"ok": False, "msg": "limit必须是整数"}, 400)
-            return self._send({"ok": True, "data": list(reversed(records[-limit:]))})
+            return self._send({"ok": True, "data": OBSERVABILITY.query(
+                event_type=query.get("event_type", [None])[0],
+                tool_name=query.get("tool_name", [None])[0],
+                skill_id=query.get("skill_id", [None])[0],
+                limit=limit,
+            )})
         config_match = re.fullmatch(r"/skill/([^/]+)/config", path)
         if config_match:
             skill_id = unquote(config_match.group(1))
-            try:
-                user = UserContext.from_dict({
-                    "user_id": query.get("user_id", ["local-user"])[0],
-                })
-                result = SKILLS.effective(skill_id, user)
-                if not result["ok"]:
-                    return self._send(result, 403 if "禁止" in result["msg"] or "不允许" in result["msg"] else 404)
-                meta = result["data"]
-                return self._send({"ok": True, "data": {
-                    "skill_id": meta["skill_id"], "name": meta["name"],
-                    "system_prompt_snippet": meta["system_prompt_snippet"],
-                    "output_schema": meta["output_schema"], "outline": meta["outline"],
-                    "required_env_vars": meta.get("required_env_vars", []),
-                }})
-            except (ValueError, TypeError) as exc:
-                return self._send({"ok": False, "msg": str(exc)}, 400)
+            result = SKILLS.effective(skill_id)
+            if not result["ok"]:
+                return self._send(result, 404)
+            meta = result["data"]
+            return self._send({"ok": True, "data": {
+                "skill_id": meta["skill_id"], "name": meta["name"],
+                "system_prompt_snippet": meta["system_prompt_snippet"],
+                "output_schema": meta["output_schema"], "outline": meta["outline"],
+                "required_env_vars": meta.get("required_env_vars", []),
+            }})
         download_match = re.fullmatch(r"/skill/([^/]+)/download", path)
         if download_match:
             skill_id = unquote(download_match.group(1))
             harness = query.get("harness", ["workbuddy"])[0]
             if harness not in {"workbuddy", "opencode"}:
                 return self._send({"ok": False, "msg": "不支持该 Harness，可选 WorkBuddy 或 OpenCode"}, 400)
-            try:
-                user = UserContext.from_dict({
-                    "user_id": query.get("user_id", ["local-user"])[0],
-                })
-                result = SKILLS.effective(skill_id, user)
-                if not result["ok"]:
-                    return self._send(result, 403 if "禁止" in result["msg"] or "不允许" in result["msg"] else 404)
-                host = self.headers.get("X-Forwarded-Host", self.headers.get("Host", "127.0.0.1:8000"))
-                scheme = self.headers.get("X-Forwarded-Proto", "http")
-                service_url = f"{scheme}://{host}"
-                archive = (workbuddy_bundle(result["data"], service_url, user) if harness == "workbuddy"
-                           else open_code_bundle(result["data"], service_url, user))
-                self.send_response(200)
-                self.send_header("Content-Type", "application/zip")
-                self.send_header("Content-Disposition", f'attachment; filename="{skill_id}-{harness}.zip"')
-                self.send_header("Content-Length", str(len(archive)))
-                self.end_headers()
-                return self.wfile.write(archive)
-            except (ValueError, TypeError) as exc:
-                return self._send({"ok": False, "msg": str(exc)}, 400)
+            result = SKILLS.effective(skill_id)
+            if not result["ok"]:
+                return self._send(result, 404)
+            host = self.headers.get("X-Forwarded-Host", self.headers.get("Host", "127.0.0.1:8000"))
+            scheme = self.headers.get("X-Forwarded-Proto", "http")
+            service_url = f"{scheme}://{host}"
+            archive = (workbuddy_bundle(result["data"], service_url) if harness == "workbuddy"
+                       else open_code_bundle(result["data"], service_url))
+            self.send_response(200)
+            self.send_header("Content-Type", "application/zip")
+            self.send_header("Content-Disposition", f'attachment; filename="{skill_id}-{harness}.zip"')
+            self.send_header("Content-Length", str(len(archive)))
+            self.end_headers()
+            return self.wfile.write(archive)
         match = re.fullmatch(r"/skill/([^/]+)/effective", path)
         if match:
-            try:
-                user = UserContext.from_dict({
-                    "user_id": query.get("user_id", [None])[0],
-                    "permissions": query.get("permissions", ["user"])[0].split(","),
-                })
-                return self._send(SKILLS.effective(unquote(match.group(1)), user))
-            except (ValueError, TypeError) as exc:
-                return self._send({"ok": False, "msg": str(exc)}, 400)
-        if path == "/audit/query":
-            records = list(STORE.audit)
-            if query.get("user_id"):
-                records = [row for row in records if row["user_id"] == query["user_id"][0]]
-            if query.get("action_type"):
-                records = [row for row in records if row["action_type"] == query["action_type"][0]]
-            try:
-                limit = max(1, min(1000, int(query.get("limit", ["100"])[0])))
-            except ValueError:
-                return self._send({"ok": False, "msg": "limit必须是整数"}, 400)
-            return self._send({"ok": True, "data": records[-limit:]})
+            return self._send(SKILLS.effective(unquote(match.group(1))))
         return self._send({"ok": False, "msg": "接口不存在"}, 404)
 
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
@@ -806,9 +814,6 @@ class RequestHandler(BaseHTTPRequestHandler):
                     generated, generation_mode = GENERATOR.generate(description)
                 except RuntimeError as exc:
                     return self._send({"ok": False, "msg": str(exc)}, 502)
-                STORE.log(operator.user_id, "skill_generate",
-                          input_snapshot={"description_sha256": hashlib.sha256(description.encode()).hexdigest()},
-                          result_preview={"skill_id": generated.get("skill_id"), "mode": generation_mode})
                 return self._send({"ok": True, "data": generated, "generation_mode": generation_mode})
             if path == "/skill/test-questions":
                 operator = self._context(body.get("operator"))
@@ -826,9 +831,6 @@ class RequestHandler(BaseHTTPRequestHandler):
                     questions, generation_mode = GENERATOR.generate_test_questions(skill, guidance)
                 except RuntimeError as exc:
                     return self._send({"ok": False, "msg": str(exc)}, 502)
-                STORE.log(operator.user_id, "skill_test_questions_generate", skill_id=skill_id,
-                          input_snapshot={"guidance_sha256": hashlib.sha256(guidance.encode()).hexdigest()},
-                          result_preview={"question_count": len(questions), "mode": generation_mode})
                 return self._send({"ok": True, "data": {"questions": questions},
                                    "generation_mode": generation_mode})
             if path == "/skill/publish":
@@ -846,6 +848,11 @@ class RequestHandler(BaseHTTPRequestHandler):
             return self._send({"ok": False, "msg": f"请求格式错误：{exc}"}, 400)
 
     def _handle_mcp(self) -> None:
+        try:
+            user = user_from_headers(self)
+        except ValueError as exc:
+            return self._send({"ok": False, "msg": str(exc)}, 401,
+                              {"WWW-Authenticate": 'Bearer realm="Custos MCP"'})
         try:
             request = self._body()
         except (ValueError, json.JSONDecodeError) as exc:
@@ -879,7 +886,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             if not isinstance(arguments, dict):
                 result = {"isError": True, "content": [{"type": "text", "text": "arguments must be an object"}]}
             else:
-                result = mcp_call(str(name), arguments, user_from_headers(self))
+                result = mcp_call(str(name), arguments, user)
         else:
             return self._send({"jsonrpc": "2.0", "id": request_id,
                                "error": {"code": -32601, "message": "Method not found"}}, 200)
@@ -894,7 +901,7 @@ def main() -> None:
     args = parser.parse_args()
     server = ThreadingHTTPServer((args.host, args.port), RequestHandler)
     print(f"Custos mock service listening on http://{args.host}:{args.port}")
-    print(f"Open http://{args.host}:{args.port}/ for the UI; GET /audit/query for audit records")
+    print(f"Open http://{args.host}:{args.port}/ for the UI; GET /runtime-logs for runtime events")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
