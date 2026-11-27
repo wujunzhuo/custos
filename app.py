@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""A dependency-free managed Skill and child-process sandbox prototype."""
+"""A dependency-free managed Skill and tool-execution prototype."""
 
 from __future__ import annotations
 
 import json
 import hashlib
 import atexit
-import math
 import os
 import re
 import signal
@@ -43,7 +42,6 @@ MODEL_NAME = os.environ.get("MODEL_NAME", os.environ.get("LLM_MODEL", "")).strip
 @dataclass
 class UserContext:
     user_id: str
-    team_id: str
     token: str = "mock-token"
     permissions: list[str] = field(default_factory=lambda: ["user"])
 
@@ -53,11 +51,10 @@ class UserContext:
             if default is None:
                 raise ValueError("缺少 user_ctx")
             return default
-        if not isinstance(value, dict) or not value.get("user_id") or not value.get("team_id"):
-            raise ValueError("user_ctx 必须包含 user_id 和 team_id")
+        if not isinstance(value, dict) or not value.get("user_id"):
+            raise ValueError("user_ctx 必须包含 user_id")
         return cls(
             user_id=str(value["user_id"]),
-            team_id=str(value["team_id"]),
             token=str(value.get("token", "mock-token")),
             permissions=list(value.get("permissions", ["user"])),
         )
@@ -69,12 +66,10 @@ class SkillMeta:
     name: str
     description: str
     version: str
-    secret_level: str
     system_prompt_snippet: str
     output_schema: dict[str, Any]
     outline: list[dict[str, Any]]
     required_env_vars: list[str] = field(default_factory=list)
-    gray_teams: list[str] = field(default_factory=list)
     update_at: float = field(default_factory=now)
 
 
@@ -82,16 +77,6 @@ class SkillMeta:
 class SecretEnvVar:
     name: str
     value: str = field(repr=False)
-    allowed_teams: list[str] = field(default_factory=list)
-
-
-@dataclass
-class RuntimeConfig:
-    max_runtime_seconds: int = 30
-    cpu_cores: float = 1.0
-    memory_mb: int = 512
-    network_mode: str = "deny_all"
-    network_hosts: list[str] = field(default_factory=list)
 
 
 class Store:
@@ -100,18 +85,17 @@ class Store:
     def __init__(self) -> None:
         self.skills: dict[str, list[SkillMeta]] = {}
         self.rollback_targets: dict[str, str] = {}
-        self.runtime_config = RuntimeConfig()
         self.secrets: dict[str, SecretEnvVar] = {}
         self.audit: list[dict[str, Any]] = []
 
     def log(self, user_id: str, action_type: str, *, skill_id: str | None = None,
-            sandbox_id: str | None = None, execution_id: str | None = None,
+            execution_id: str | None = None,
             tool_name: str | None = None, input_snapshot: Any = None,
             result_preview: Any = None, tags: list[str] | None = None) -> str:
         ref = trace_id()
         self.audit.append({
             "trace_id": ref, "user_id": user_id, "skill_id": skill_id,
-            "sandbox_id": sandbox_id, "execution_id": execution_id, "action_type": action_type,
+            "execution_id": execution_id, "action_type": action_type,
             "tool_name": tool_name,
             "input_snapshot": input_snapshot, "result_preview": result_preview,
             "timestamp": now(), "tags": tags or [],
@@ -132,10 +116,6 @@ class SkillService:
             return {"ok": False, "msg": "名称、描述和运行时提示词不能为空"}
         if not isinstance(meta.outline, list) or not isinstance(meta.output_schema, dict):
             return {"ok": False, "msg": "outline必须是数组，output_schema必须是对象"}
-        if not isinstance(meta.gray_teams, list):
-            return {"ok": False, "msg": "Skill配置字段类型不合法"}
-        if meta.secret_level not in {"public", "internal", "confidential"}:
-            return {"ok": False, "msg": "secret_level不合法"}
         if not isinstance(meta.required_env_vars, list) or any(
                 not isinstance(name, str) or not re.fullmatch(r"[A-Z_][A-Z0-9_]*", name)
                 for name in meta.required_env_vars):
@@ -149,8 +129,7 @@ class SkillService:
         versions.append(meta)
         self.store.rollback_targets.pop(meta.skill_id, None)
         self.store.log(operator.user_id, "skill_publish", skill_id=meta.skill_id,
-                       result_preview={"version": meta.version},
-                       tags=[f"secret_level:{meta.secret_level}"])
+                       result_preview={"version": meta.version})
         return {"ok": True, "data": asdict(meta)}
 
     def effective(self, skill_id: str, user: UserContext, *, audit: bool = True) -> dict[str, Any]:
@@ -158,10 +137,9 @@ class SkillService:
         if not versions:
             return {"ok": False, "msg": "skill不存在"}
         target = self.store.rollback_targets.get(skill_id)
-        candidates = [v for v in versions if (not target or v.version == target)
-                      and (not v.gray_teams or user.team_id in v.gray_teams)]
+        candidates = [v for v in versions if not target or v.version == target]
         if not candidates:
-            return {"ok": False, "msg": "当前团队不可用该skill版本"}
+            return {"ok": False, "msg": "当前没有可用的skill版本"}
         selected = max(candidates, key=lambda item: item.update_at)
         if audit:
             self.store.log(user.user_id, "skill_fetch", skill_id=skill_id,
@@ -186,12 +164,12 @@ class SkillService:
                 for versions in self.store.skills.values() if versions]
 
 
-class SandboxService:
-    """Local child-process simulation; intentionally not a production security boundary."""
+class ToolExecutionService:
+    """Run prototype tool code in a temporary child process; this is not a sandbox."""
 
     MAX_CODE_BYTES = 64 * 1024
     MAX_OUTPUT_BYTES = 256 * 1024
-    RUNTIME_ID = "subprocess-mock"
+    TIMEOUT_SECONDS = 30
 
     def __init__(self, store: Store, skills: SkillService):
         self.store, self.skills = store, skills
@@ -203,7 +181,6 @@ class SandboxService:
         return text
 
     def run(self, skill_id: str, code: str, user: UserContext) -> dict[str, Any]:
-        sandbox_id = self.RUNTIME_ID
         if not isinstance(code, str) or not code.strip() or len(code.encode("utf-8")) > self.MAX_CODE_BYTES:
             return {"ok": False, "msg": "代码不能为空且不能超过64KB"}
         effective = self.skills.effective(skill_id, user, audit=False)
@@ -215,15 +192,12 @@ class SandboxService:
             secret = self.store.secrets.get(name)
             if secret is None:
                 return {"ok": False, "msg": f"Skill需要的环境变量 {name} 尚未由管理员配置"}
-            if secret.allowed_teams and user.team_id not in secret.allowed_teams:
-                return {"ok": False, "msg": f"当前团队无权申请环境变量 {name}"}
             runtime_secrets[name] = secret.value
         if sum(len(name) + len(value) for name, value in runtime_secrets.items()) > 64 * 1024:
             return {"ok": False, "msg": "本次申请的环境变量总大小超过64KB"}
 
         execution_id = trace_id("exec")
         started = time.monotonic()
-        runtime = self.store.runtime_config
         with tempfile.TemporaryDirectory(prefix="custos-run-") as workdir:
             script_path = os.path.join(workdir, "main.py")
             with open(script_path, "w", encoding="utf-8") as script:
@@ -235,26 +209,7 @@ class SandboxService:
                 env["SYSTEMROOT"] = os.environ["SYSTEMROOT"]
             env.update(runtime_secrets)
             stdout_file, stderr_file = tempfile.TemporaryFile(), tempfile.TemporaryFile()
-            bootstrap = (
-                "import runpy, sys\n"
-                "try:\n"
-                " import resource\n"
-                f" resource.setrlimit(resource.RLIMIT_FSIZE, ({self.MAX_OUTPUT_BYTES}, {self.MAX_OUTPUT_BYTES}))\n"
-                " resource.setrlimit(resource.RLIMIT_CORE, (0, 0))\n"
-                " try:\n"
-                f"  cpu_budget = {math.ceil(runtime.max_runtime_seconds * float(runtime.cpu_cores)) + 1}\n"
-                "  resource.setrlimit(resource.RLIMIT_CPU, (cpu_budget, cpu_budget))\n"
-                " except (AttributeError, ValueError, OSError):\n"
-                "  pass\n"
-                " try:\n"
-                f"  memory_bytes = {runtime.memory_mb * 1024 * 1024}\n"
-                "  resource.setrlimit(resource.RLIMIT_AS, (memory_bytes, memory_bytes))\n"
-                " except (AttributeError, ValueError, OSError):\n"
-                "  pass\n"
-                "except (ImportError, AttributeError, ValueError, OSError):\n"
-                " pass\n"
-                "runpy.run_path(sys.argv[1], run_name='__main__')\n"
-            )
+            bootstrap = "import runpy, sys\nrunpy.run_path(sys.argv[1], run_name='__main__')\n"
             try:
                 process = subprocess.Popen(
                     [sys.executable, "-I", "-S", "-c", bootstrap, script_path],
@@ -265,10 +220,10 @@ class SandboxService:
             except OSError as exc:
                 stdout_file.close()
                 stderr_file.close()
-                return {"ok": False, "msg": f"无法启动沙箱子进程：{exc}"}
+                return {"ok": False, "msg": f"无法启动工具子进程：{exc}"}
             timed_out = False
             try:
-                process.wait(timeout=runtime.max_runtime_seconds)
+                process.wait(timeout=self.TIMEOUT_SECONDS)
             except subprocess.TimeoutExpired:
                 timed_out = True
                 if os.name != "nt":
@@ -295,15 +250,12 @@ class SandboxService:
             stderr = self._redact(stderr[:self.MAX_OUTPUT_BYTES], runtime_secrets)
         duration_ms = round((time.monotonic() - started) * 1000)
         response = {
-            "execution_id": execution_id, "sandbox_id": sandbox_id, "skill_id": skill_id,
+            "execution_id": execution_id, "skill_id": skill_id,
             "exit_code": process.returncode, "timed_out": timed_out,
             "duration_ms": duration_ms, "stdout": stdout, "stderr": stderr,
             "output_truncated": truncated,
-            "runtime_limits": {"max_runtime_seconds": runtime.max_runtime_seconds,
-                               "cpu_cores": runtime.cpu_cores, "memory_mb": runtime.memory_mb,
-                               "network_policy_enforced": False},
         }
-        self.store.log(user.user_id, "sandbox_run", skill_id=skill_id, sandbox_id=sandbox_id,
+        self.store.log(user.user_id, "tool_execution", skill_id=skill_id,
                        execution_id=execution_id,
                        input_snapshot={"code_sha256": hashlib.sha256(code.encode()).hexdigest(),
                                         "code_bytes": len(code.encode())},
@@ -322,8 +274,7 @@ class SecretService:
         self.store = store
 
     def list_public(self) -> list[dict[str, Any]]:
-        return [{"name": secret.name, "value": secret.value,
-                 "allowed_teams": list(secret.allowed_teams)}
+        return [{"name": secret.name, "value": secret.value}
                 for secret in self.store.secrets.values()]
 
     def configure(self, secret: SecretEnvVar, operator: UserContext) -> dict[str, Any]:
@@ -333,12 +284,10 @@ class SecretService:
             return {"ok": False, "msg": "环境变量名须符合 [A-Z_][A-Z0-9_]*"}
         if not isinstance(secret.value, str) or not secret.value or len(secret.value) > 16_384 or "\x00" in secret.value:
             return {"ok": False, "msg": "环境变量值不能为空且长度不能超过16KB"}
-        if not isinstance(secret.allowed_teams, list) or any(not isinstance(team, str) for team in secret.allowed_teams):
-            return {"ok": False, "msg": "allowed_teams必须是字符串数组"}
         self.store.secrets[secret.name] = secret
-        self.store.log(operator.user_id, "secret_configure", result_preview={"name": secret.name,
-                       "allowed_teams": secret.allowed_teams}, tags=["secret_value_not_audited"])
-        return {"ok": True, "data": {"name": secret.name, "allowed_teams": secret.allowed_teams}}
+        self.store.log(operator.user_id, "secret_configure", result_preview={"name": secret.name},
+                       tags=["secret_value_not_audited"])
+        return {"ok": True, "data": {"name": secret.name}}
 
     def remove(self, name: str, operator: UserContext) -> dict[str, Any]:
         if "admin" not in operator.permissions:
@@ -350,45 +299,11 @@ class SecretService:
         return {"ok": True, "data": {"name": name, "removed": True}}
 
 
-class RuntimeConfigService:
-    def __init__(self, store: Store):
-        self.store = store
-
-    def public(self) -> dict[str, Any]:
-        return {"runtime_id": "subprocess-mock", "name": "本地子进程模拟",
-                "runtime_type": "subprocess_mock", **asdict(self.store.runtime_config),
-                "network_policy_enforced": False}
-
-    def configure(self, config: RuntimeConfig, operator: UserContext) -> dict[str, Any]:
-        if "admin" not in operator.permissions:
-            return {"ok": False, "msg": "无权限配置运行时"}
-        if isinstance(config.max_runtime_seconds, bool) or not isinstance(config.max_runtime_seconds, int) or not 1 <= config.max_runtime_seconds <= 3600:
-            return {"ok": False, "msg": "最长运行时间范围为1-3600秒"}
-        if isinstance(config.cpu_cores, bool) or not isinstance(config.cpu_cores, (int, float)) or not 0.1 <= config.cpu_cores <= 16:
-            return {"ok": False, "msg": "CPU限制范围为0.1-16核"}
-        if isinstance(config.memory_mb, bool) or not isinstance(config.memory_mb, int) or not 128 <= config.memory_mb <= 32768:
-            return {"ok": False, "msg": "内存限制范围为128-32768 MB"}
-        if config.network_mode not in {"allowlist", "denylist", "deny_all"}:
-            return {"ok": False, "msg": "网络策略须为allowlist、denylist或deny_all"}
-        if not isinstance(config.network_hosts, list) or len(config.network_hosts) > 100:
-            return {"ok": False, "msg": "网络规则最多100条"}
-        for host in config.network_hosts:
-            if not isinstance(host, str) or not re.fullmatch(r"(?:\*\.)?[A-Za-z0-9][A-Za-z0-9.:-]{0,252}", host) or ".." in host:
-                return {"ok": False, "msg": f"网络规则格式不合法：{host}"}
-        self.store.runtime_config = config
-        self.store.log(operator.user_id, "runtime_configure",
-                       result_preview={"max_runtime_seconds": config.max_runtime_seconds,
-                                       "cpu_cores": config.cpu_cores, "memory_mb": config.memory_mb,
-                                       "network_mode": config.network_mode,
-                                       "network_hosts": config.network_hosts})
-        return {"ok": True, "data": self.public()}
-
-
 class SkillGenerator:
     """OpenAI-compatible generator, with a deterministic local fallback for offline use."""
 
     @staticmethod
-    def runtime_config() -> dict[str, Any]:
+    def model_config() -> dict[str, Any]:
         return {"provider": "remote" if MODEL_BASE_URL and MODEL_NAME else "mock",
                 "base_url": MODEL_BASE_URL, "model": MODEL_NAME,
                 "api_key_configured": bool(MODEL_API_KEY)}
@@ -403,7 +318,7 @@ class SkillGenerator:
                        {"title": "风险与问题", "guidance": "列出阻塞及需要协助的事项。"},
                        {"title": "下周计划", "guidance": "按优先级列出计划和交付物。"}]
         elif contacts:
-            name, skill_id = "Custos 团队通讯录", "custos-team-contacts"
+            name, skill_id = "Custos 通讯录", "custos-contacts"
             outline = [{"title": "可用文件"}, {"title": "匹配联系人"}, {"title": "联系信息"}]
         else:
             name, skill_id = "自定义 Skill", "custom-skill"
@@ -414,7 +329,6 @@ class SkillGenerator:
             "outline": outline,
             "output_schema": {"type": "object", "required": [part["title"] for part in outline]},
             "required_env_vars": ["CUSTOS_CONTACTS_DIR"] if contacts else [],
-            "secret_level": "internal", "gray_teams": [],
         }
 
     @staticmethod
@@ -430,9 +344,9 @@ class SkillGenerator:
         required = {"skill_id", "name", "description", "system_prompt_snippet", "outline", "output_schema"}
         if not isinstance(result, dict) or not required.issubset(result):
             raise ValueError("模型返回缺少 Skill 必需字段")
+        allowed = required | {"required_env_vars"}
+        result = {key: value for key, value in result.items() if key in allowed}
         result.setdefault("required_env_vars", [])
-        result.setdefault("secret_level", "internal")
-        result.setdefault("gray_teams", [])
         return result
 
     def generate(self, description: str) -> tuple[dict[str, Any], str]:
@@ -448,8 +362,7 @@ class SkillGenerator:
                     "你是企业 Skill 设计器。根据管理员的需求，生成可执行、边界明确的 Skill 配置。"
                     "只返回 JSON 对象，字段为 skill_id(小写kebab-case), name, description, system_prompt_snippet, "
                     "outline(对象数组，包含title和可选guidance), output_schema(JSON Schema对象), "
-                    "required_env_vars(环境变量名数组，只填写明确需要的名称，不得填写或猜测变量值), "
-                    "secret_level(public/internal/confidential), gray_teams(字符串数组)。"
+                    "required_env_vars(环境变量名数组，只填写明确需要的名称，不得填写或猜测变量值)。"
                     "不允许生成可执行代码、脚本或环境变量值。"
                 )},
                 {"role": "user", "content": description},
@@ -509,7 +422,7 @@ class SkillGenerator:
                 {"role": "user", "content": json.dumps({
                     "skill": {key: skill.get(key) for key in (
                         "skill_id", "name", "description", "system_prompt_snippet", "outline", "output_schema",
-                        "required_env_vars", "secret_level")},
+                        "required_env_vars")},
                     "user_guidance": guidance,
                 }, ensure_ascii=False)},
             ],
@@ -558,48 +471,60 @@ class SkillGenerator:
 GENERATOR = SkillGenerator()
 
 
-def build_app() -> tuple[Store, SkillService, SandboxService, SecretService, RuntimeConfigService]:
+def build_app() -> tuple[Store, SkillService, ToolExecutionService, SecretService]:
     store = Store()
     skills = SkillService(store)
-    sandboxes = SandboxService(store, skills)
+    tool_executor = ToolExecutionService(store, skills)
     secrets = SecretService(store)
-    runtime_config = RuntimeConfigService(store)
-    admin = UserContext("seed-admin", "platform", permissions=["admin"])
+    admin = UserContext("seed-admin", permissions=["admin"])
     contacts_dir = tempfile.mkdtemp(prefix="custos-contacts-")
     atexit.register(shutil.rmtree, contacts_dir, ignore_errors=True)
-    contacts_file = Path(contacts_dir) / "custos_team_contacts.csv"
+    contacts_file = Path(contacts_dir) / "custos_contacts.csv"
     contacts_file.write_text(
-        "name,team,role,email\n"
+        "name,department,role,email\n"
         "Lin Chen,Custos Platform,Platform Lead,lin.chen@custos.example\n"
         "Mei Wang,Product,Product Manager,mei.wang@custos.example\n"
         "Alex Kim,Engineering,Backend Engineer,alex.kim@custos.example\n"
-        "Rui Zhang,People Operations,People Partner,rui.zhang@custos.example\n",
+        "Rui Zhang,People Operations,People Partner,rui.zhang@custos.example\n"
+        "Jia Liu,Design,UX Designer,jia.liu@custos.example\n"
+        "Omar Hassan,Security,Security Engineer,omar.hassan@custos.example\n"
+        "Priya Patel,Data,Data Scientist,priya.patel@custos.example\n"
+        "Noah Williams,Finance,Finance Analyst,noah.williams@custos.example\n"
+        "Sofia Garcia,Marketing,Marketing Manager,sofia.garcia@custos.example\n"
+        "Ethan Brown,Sales,Account Executive,ethan.brown@custos.example\n"
+        "Yuki Tanaka,Customer Support,Support Specialist,yuki.tanaka@custos.example\n"
+        "Amara Okafor,Legal,Legal Counsel,amara.okafor@custos.example\n"
+        "Mateo Rossi,Quality,QA Engineer,mateo.rossi@custos.example\n"
+        "Chloe Dubois,Infrastructure,DevOps Engineer,chloe.dubois@custos.example\n"
+        "Arjun Mehta,AI Research,Machine Learning Engineer,arjun.mehta@custos.example\n"
+        "Emma Wilson,Documentation,Technical Writer,emma.wilson@custos.example\n"
+        "Diego Silva,Procurement,Procurement Specialist,diego.silva@custos.example\n"
+        "Hana Suzuki,Mobile,Mobile Developer,hana.suzuki@custos.example\n"
+        "Grace Lee,Operations,Operations Manager,grace.lee@custos.example\n"
+        "Lucas Martin,Solutions,Solutions Architect,lucas.martin@custos.example\n",
         encoding="utf-8",
     )
-    secrets.configure(SecretEnvVar(name="CUSTOS_CONTACTS_DIR", value=contacts_dir,
-                                   allowed_teams=["custos-team"]), admin)
+    secrets.configure(SecretEnvVar(name="CUSTOS_CONTACTS_DIR", value=contacts_dir), admin)
     skills.publish(SkillMeta(
-        skill_id="weekly-report", name="Custos 周报助手", description="根据团队成员提供的信息整理周报。", version="1.0.0",
-        secret_level="internal",
-        system_prompt_snippet="你是 Custos 团队周报助手。请基于用户提供的信息整理周报，不要编造事实；缺失内容明确标注待补充。最终文档第一行必须精确使用标题：Custos 团队周报。该标题是服务端托管模板的一部分。",
+        skill_id="weekly-report", name="Custos 周报助手", description="根据用户提供的信息整理周报。", version="1.0.0",
+        system_prompt_snippet="你是 Custos 周报助手。请基于用户提供的信息整理周报，不要编造事实；缺失内容明确标注待补充。最终文档第一行必须精确使用标题：Custos 周报。该标题是服务端托管模板的一部分。",
         output_schema={"type": "object", "required": ["本周完成", "风险与问题", "下周计划"]},
         outline=[{"title": "本周完成", "guidance": "概括本周完成的工作与阶段性成果。"},
                  {"title": "风险与问题", "guidance": "列出阻塞、风险和需要协助的事项；没有则注明暂无。"},
                  {"title": "下周计划", "guidance": "按优先级列出下周计划和预期交付。"}],
-        gray_teams=["custos-team"]), admin)
+        ), admin)
     skills.publish(SkillMeta(
-        skill_id="custos-team-contacts", name="Custos 团队通讯录", description="列出并读取 Custos 企业私有联系人目录。", version="1.0.0",
-        secret_level="internal",
-        system_prompt_snippet="你可以使用一次性 Python 子进程读取企业私有通讯录。运行时环境变量 CUSTOS_CONTACTS_DIR 是允许访问的绝对目录。需要先用 pathlib.Path(os.environ['CUSTOS_CONTACTS_DIR']).iterdir() 列出目录文件，再按需读取其中的 CSV 文件并查找联系人姓名、团队、职位或邮箱。不得访问该目录之外的文件；不得虚构或泄露与用户请求无关的联系人信息。",
+        skill_id="custos-contacts", name="Custos 通讯录", description="列出并读取 Custos 企业联系人目录。", version="1.0.0",
+        system_prompt_snippet="你可以使用一次性 Python 子进程读取企业通讯录。运行时环境变量 CUSTOS_CONTACTS_DIR 是允许访问的绝对目录。需要先用 pathlib.Path(os.environ['CUSTOS_CONTACTS_DIR']).iterdir() 列出目录文件，再按需读取其中的 CSV 文件并查找联系人姓名、部门、职位或邮箱。不得访问该目录之外的文件；不得虚构或泄露与用户请求无关的联系人信息。",
         output_schema={"type": "object", "required": ["files", "contacts"]},
         outline=[{"title": "可用文件"}, {"title": "匹配联系人"}, {"title": "联系信息"}],
-        required_env_vars=["CUSTOS_CONTACTS_DIR"], gray_teams=["custos-team"]), admin)
+        required_env_vars=["CUSTOS_CONTACTS_DIR"]), admin)
     # Startup fixtures are not user actions; keep the audit view focused on runtime activity.
     store.audit.clear()
-    return store, skills, sandboxes, secrets, runtime_config
+    return store, skills, tool_executor, secrets
 
 
-STORE, SKILLS, SANDBOXES, SECRETS, RUNTIME_CONFIG = build_app()
+STORE, SKILLS, TOOL_EXECUTOR, SECRETS = build_app()
 
 
 def make_skill_markdown(meta: dict[str, Any]) -> str:
@@ -619,7 +544,7 @@ This Custos skill has server-managed runtime instructions that may change withou
 1. At the start of each task, call the `get_skill_config` tool on the `custos` MCP server with `skill_id: {meta['skill_id']}`.
 2. Follow the latest `system_prompt_snippet`, `outline`, and `output_schema` returned by the service. Do not rely on an old copy of those settings.
 3. Use only the current `required_env_vars` returned by `get_skill_config` to request environment variables; the bundle-time list below may be stale after a server-side update. Secret values are resolved by the service and must never be requested from the user or printed.
-4. If the task needs generated code or a script, call the generic `run_code` tool on the `custos` MCP server with this `skill_id`. The runtime is centrally selected by the platform.
+4. If the task needs generated code or a script, call the generic `run_code` tool on the `custos` MCP server with this `skill_id`. This prototype runs code in a temporary child process; it is not a sandbox.
 5. If the service rejects access or execution, stop and explain the denial; do not access the resource through another route.
 
 ## Current platform configuration
@@ -634,7 +559,6 @@ This Custos skill has server-managed runtime instructions that may change withou
 def user_from_headers(handler: BaseHTTPRequestHandler) -> UserContext:
     return UserContext(
         user_id=handler.headers.get("X-User-ID", "local-user"),
-        team_id=handler.headers.get("X-Team-ID", "backend-dev"),
         token=handler.headers.get("Authorization", "mock-token"),
         permissions=["user"],
     )
@@ -650,7 +574,6 @@ def workbuddy_bundle(meta: dict[str, Any], service_url: str, user: UserContext,
             "type": "streamableHttp", "url": f"{service_url.rstrip('/')}/mcp", "timeout": 30000,
             "headers": {
                 "X-User-ID": user.user_id,
-                "X-Team-ID": user.team_id,
             },
         }},
     }
@@ -661,7 +584,7 @@ def workbuddy_bundle(meta: dict[str, Any], service_url: str, user: UserContext,
         archive.writestr("SKILL.md", skill_markdown)
         archive.writestr("CUSTOS-SETUP.txt", (
             "Import the skills/<skill-id>/ folder into WorkBuddy's Skills area (or copy it to ~/.workbuddy/skills/).\n"
-            "Configure the included mcp.json in WorkBuddy's MCP settings to connect Custos for runtime configuration and tool execution.\n"
+            "Configure the included mcp.json in WorkBuddy's MCP settings to connect Custos for managed Skill configuration and tool execution.\n"
             "SKILL.md at the archive root is a visible copy; the active skill is under skills/<skill-id>/.\n"
             "This local mock platform does not authenticate identities; its MCP headers only simulate user context.\n"
         ))
@@ -675,7 +598,7 @@ def open_code_bundle(meta: dict[str, Any], service_url: str, user: UserContext) 
         "skills": ["./.opencode/skills"],
         "mcp": {"servers": {"custos": {
             "type": "remote", "url": f"{service_url.rstrip('/')}/mcp", "oauth": False,
-            "headers": {"X-User-ID": user.user_id, "X-Team-ID": user.team_id},
+            "headers": {"X-User-ID": user.user_id},
         }}},
     }
     with zipfile.ZipFile(bundle, "w", zipfile.ZIP_DEFLATED) as archive:
@@ -685,7 +608,7 @@ def open_code_bundle(meta: dict[str, Any], service_url: str, user: UserContext) 
         archive.writestr("SKILL.md", skill_markdown)
         archive.writestr("CUSTOS-SETUP.txt", (
             "Extract this archive into an OpenCode project directory.\n"
-            "The included OpenCode config connects the Custos MCP server for runtime configuration and tool execution.\n"
+            "The included OpenCode config connects the Custos MCP server for managed Skill configuration and tool execution.\n"
             "The active skill is under .opencode/skills/.\n"
             "This local mock platform does not authenticate identities; its MCP headers only simulate user context.\n"
         ))
@@ -699,7 +622,7 @@ def mcp_tool_catalog() -> list[dict[str, Any]]:
          "inputSchema": {"type": "object", "properties": {"skill_id": {"type": "string"}},
                          "required": ["skill_id"], "additionalProperties": False}},
         {"name": "run_code",
-         "description": "Run temporary Python code in the currently selected child-process mock runtime. Skill-declared server secrets are injected for this execution only.",
+         "description": "Run temporary Python code in a child process for this prototype. This is not a sandbox. Skill-declared server variables are injected for this execution only.",
          "inputSchema": {"type": "object", "properties": {
              "skill_id": {"type": "string"},
              "code": {"type": "string", "description": "Python source code, maximum 64KB."}},
@@ -724,7 +647,7 @@ def mcp_call(name: str, arguments: dict[str, Any], user: UserContext) -> dict[st
             response = {"content": [{"type": "text", "text": json.dumps(data, ensure_ascii=False)}],
                         "structuredContent": data}
     elif name == "run_code":
-        result = SANDBOXES.run(skill_id, arguments.get("code", ""), user)
+        result = TOOL_EXECUTOR.run(skill_id, arguments.get("code", ""), user)
         if not result["ok"]:
             response = {"isError": True, "content": [{"type": "text", "text": result["msg"]}]}
         else:
@@ -810,11 +733,9 @@ class RequestHandler(BaseHTTPRequestHandler):
         if path == "/health":
             return self._send({"ok": True, "service": "custos-mock"})
         if path == "/model/config":
-            return self._send({"ok": True, "data": GENERATOR.runtime_config()})
+            return self._send({"ok": True, "data": GENERATOR.model_config()})
         if path == "/skills":
             return self._send({"ok": True, "data": [asdict(item) for item in SKILLS.latest_versions()]})
-        if path == "/runtime":
-            return self._send({"ok": True, "data": RUNTIME_CONFIG.public()})
         if path == "/secrets":
             return self._send({"ok": True, "data": SECRETS.list_public()})
         if path == "/runtime-logs":
@@ -834,7 +755,6 @@ class RequestHandler(BaseHTTPRequestHandler):
             try:
                 user = UserContext.from_dict({
                     "user_id": query.get("user_id", ["local-user"])[0],
-                    "team_id": query.get("team_id", ["backend-dev"])[0],
                 })
                 result = SKILLS.effective(skill_id, user)
                 if not result["ok"]:
@@ -854,12 +774,9 @@ class RequestHandler(BaseHTTPRequestHandler):
             harness = query.get("harness", ["workbuddy"])[0]
             if harness not in {"workbuddy", "opencode"}:
                 return self._send({"ok": False, "msg": "不支持该 Harness，可选 WorkBuddy 或 OpenCode"}, 400)
-            versions = STORE.skills.get(skill_id, [])
-            team_default = versions[-1].gray_teams[0] if versions and versions[-1].gray_teams else "backend-dev"
             try:
                 user = UserContext.from_dict({
                     "user_id": query.get("user_id", ["local-user"])[0],
-                    "team_id": query.get("team_id", [team_default])[0],
                 })
                 result = SKILLS.effective(skill_id, user)
                 if not result["ok"]:
@@ -882,7 +799,6 @@ class RequestHandler(BaseHTTPRequestHandler):
             try:
                 user = UserContext.from_dict({
                     "user_id": query.get("user_id", [None])[0],
-                    "team_id": query.get("team_id", [None])[0],
                     "permissions": query.get("permissions", ["user"])[0].split(","),
                 })
                 return self._send(SKILLS.effective(unquote(match.group(1)), user))
@@ -950,20 +866,12 @@ class RequestHandler(BaseHTTPRequestHandler):
             if path == "/skill/rollback":
                 operator = self._context(body.get("operator"))
                 return self._send(SKILLS.rollback(str(body["skill_id"]), str(body["target_version"]), operator))
-            if path == "/runtime/configure":
-                operator = self._context(body.get("operator"))
-                config = RuntimeConfig(**body["config"])
-                return self._send(RUNTIME_CONFIG.configure(config, operator))
             if path == "/secrets/configure":
                 operator = self._context(body.get("operator"))
                 return self._send(SECRETS.configure(SecretEnvVar(**body["secret"]), operator))
             if path == "/secrets/remove":
                 operator = self._context(body.get("operator"))
                 return self._send(SECRETS.remove(str(body.get("name", "")), operator))
-            if path == "/sandbox/run":
-                user = self._context(body.get("user_ctx"))
-                return self._send(SANDBOXES.run(str(body.get("skill_id", "")),
-                                                body.get("code", ""), user))
             return self._send({"ok": False, "msg": "接口不存在"}, 404)
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             return self._send({"ok": False, "msg": f"请求格式错误：{exc}"}, 400)
@@ -990,7 +898,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 "protocolVersion": params.get("protocolVersion", "2025-03-26"),
                 "capabilities": {"tools": {"listChanged": False}},
                 "serverInfo": {"name": "custos", "version": "0.1.0"},
-        "instructions": "Managed Skill config is fetched at runtime. run_code executes temporary generated code in the centrally selected child-process mock. Only Skill-declared, team-authorized server environment variables are injected for that run. This is not a security boundary.",
+        "instructions": "Managed Skill config is fetched for each task. run_code executes temporary generated code in a child process for this prototype. Only Skill-declared server environment variables are injected for that run. This is not a sandbox or security boundary.",
             }
         elif method == "ping":
             result = {}

@@ -11,6 +11,10 @@
     .table-wrap{overflow:auto}table{width:100%;border-collapse:collapse;text-align:left}th,td{padding:12px 14px;border-bottom:1px solid #f0f2f6;vertical-align:top}th{font-size:10px;color:#8490a4;background:#fcfcfd;font-weight:700;white-space:nowrap}td{font-size:12px;color:#4f5b70}.tool{font-weight:750;color:var(--ink)}.mono{font:10px ui-monospace,SFMono-Regular,Menlo,monospace;color:#758198;word-break:break-all}.status{display:inline-block;border-radius:99px;padding:3px 7px;font-size:10px;font-weight:700;background:#eaf6f1;color:var(--green)}.status.error{background:#fff0f0;color:var(--red)}details summary{cursor:pointer;color:var(--blue);font-size:11px}pre{white-space:pre-wrap;word-break:break-word;background:#f7f8fb;border-radius:7px;padding:10px;max-width:450px;max-height:260px;overflow:auto;font:10px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace}.empty{text-align:center;padding:34px;color:#909bad}.count{white-space:nowrap}
     @media(max-width:700px){header{padding:0 10px}.nav a{padding:7px 6px;font-size:10px}main{padding:0 12px;margin-top:22px}.toolbar{align-items:flex-start;flex-direction:column}.filters{width:100%;flex-wrap:wrap}.filters input{flex:1;min-width:130px}}
   </style>
+  <style>
+    header{padding:0 max(22px,calc((100vw - 1160px)/2))}main{margin:32px auto 0}
+    @media(max-width:740px){header{padding:0 12px}.nav a{padding:7px 8px;font-size:11px}main{padding:0 12px;margin-top:22px}}
+  </style>
 </head>
 <body>
   <header><div class="brand">✳ Custos</div><nav class="nav"><a href="/">Skill 管理</a><a href="/secrets-page">环境变量</a><a class="active" href="/runtime-logs-page">运行时日志</a></nav></header>
